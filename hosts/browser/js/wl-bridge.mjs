@@ -44,7 +44,7 @@ export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `crates/gex-wayland`
  *  (`push_record`), which both the guest shim and the X server's bridge
  *  write. */
-export const REC = 119;
+export const REC = 138;
 /** Words in one input event. Must match `EV` in `hosts/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -106,6 +106,14 @@ export const R_INPUT_H = 36;
 export const R_ADDR_HI = 37;
 /** A record's pixel address, both halves, as a Number (exact below 2^53). */
 export const recordAddr = (a, r) => (a[r + R_ADDR] >>> 0) + (a[r + R_ADDR_HI] >>> 0) * 0x100000000;
+/** Glass (`gex_glass_v1`, `gex_wayland::REC_GLASS`): rectangle count,
+ *  colorization ARGB, balance (bits 0..7) and blur balance (8..15), then x,
+ *  y, w, h per rectangle. */
+export const R_GLASS = 119;
+export const R_GLASS_ARGB = 120;
+export const R_GLASS_BALANCE = 121;
+export const R_GLASS_RECTS = 122;
+export const GLASS_RECTS = 4;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
 /** The client grabbed the pointer for the surface (placement version 4): every pointer event is its. */
@@ -457,10 +465,29 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         input: (a[r + R_FLAGS] & F_INPUT_REGION)
           ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
           : null,
+        glass: glassOf(a, r),
       });
     }
   }
   return { surfaces: out, blocks };
+}
+
+/** A record's glass: null without any, else its rectangles (surface
+ *  units) and DWM's colorization parameters. */
+function glassOf(a, r) {
+  const count = Math.min(a[r + R_GLASS], GLASS_RECTS);
+  if (count <= 0) return null;
+  const rects = [];
+  for (let i = 0; i < count; i++) {
+    const q = r + R_GLASS_RECTS + 4 * i;
+    rects.push({ x: a[q], y: a[q + 1], w: a[q + 2], h: a[q + 3] });
+  }
+  return {
+    rects,
+    argb: a[r + R_GLASS_ARGB] >>> 0,
+    balance: a[r + R_GLASS_BALANCE] & 0xff,
+    blurBalance: (a[r + R_GLASS_BALANCE] >> 8) & 0xff,
+  };
 }
 
 /**
