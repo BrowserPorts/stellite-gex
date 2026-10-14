@@ -44,7 +44,7 @@ export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `crates/gex-wayland`
  *  (`push_record`), which both the guest shim and the X server's bridge
  *  write. */
-export const REC = 155;
+export const REC = 159;
 /** Words in one input event. Must match `EV` in `hosts/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -119,6 +119,9 @@ export const GLASS_RECTS = 4;
  *  min buttons as x, y, w, h, state. */
 export const R_GLASS_FRAME = 138;
 export const R_GLASS_AFTERGLOW = 154;
+/** With a frame: the client area, x, y, w, h; outside it the frame is drawn
+ *  over the surface. */
+export const R_GLASS_CLIENT = 155;
 export const GLASS_FRAME_ON = 1;
 export const GLASS_FRAME_ACTIVE = 2;
 export const GLASS_FRAME_MAXIMIZED = 4;
@@ -507,6 +510,7 @@ function glassOf(a, r) {
     blurBalance: (a[r + R_GLASS_BALANCE] >> 8) & 0xff,
     afterglow: a[r + R_GLASS_AFTERGLOW] >>> 0,
     afterglowBalance: (a[r + R_GLASS_BALANCE] >> 16) & 0xff,
+    client: { x: a[r + R_GLASS_CLIENT], y: a[r + R_GLASS_CLIENT + 1], w: a[r + R_GLASS_CLIENT + 2], h: a[r + R_GLASS_CLIENT + 3] },
   };
 }
 
