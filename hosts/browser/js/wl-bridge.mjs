@@ -44,7 +44,7 @@ export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `crates/gex-wayland`
  *  (`push_record`), which both the guest shim and the X server's bridge
  *  write. */
-export const REC = 138;
+export const REC = 154;
 /** Words in one input event. Must match `EV` in `hosts/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -114,6 +114,13 @@ export const R_GLASS_ARGB = 120;
 export const R_GLASS_BALANCE = 121;
 export const R_GLASS_RECTS = 122;
 export const GLASS_RECTS = 4;
+/** The frame the compositor draws (`set_frame`): flags, then close, max and
+ *  min buttons as x, y, w, h, state. */
+export const R_GLASS_FRAME = 138;
+export const GLASS_FRAME_ON = 1;
+export const GLASS_FRAME_ACTIVE = 2;
+export const GLASS_FRAME_MAXIMIZED = 4;
+export const GLASS_FRAME_TOOL = 8;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
 /** The client grabbed the pointer for the surface (placement version 4): every pointer event is its. */
@@ -482,8 +489,17 @@ function glassOf(a, r) {
     const q = r + R_GLASS_RECTS + 4 * i;
     rects.push({ x: a[q], y: a[q + 1], w: a[q + 2], h: a[q + 3] });
   }
+  const buttons = [];
+  for (let i = 0; i < 3; i++) {
+    const q = r + R_GLASS_FRAME + 1 + 5 * i;
+    buttons.push({ x: a[q], y: a[q + 1], w: a[q + 2], h: a[q + 3], state: a[q + 4] });
+  }
   return {
     rects,
+    frame: a[r + R_GLASS_FRAME] >>> 0,
+    close: buttons[0],
+    max: buttons[1],
+    min: buttons[2],
     argb: a[r + R_GLASS_ARGB] >>> 0,
     balance: a[r + R_GLASS_BALANCE] & 0xff,
     blurBalance: (a[r + R_GLASS_BALANCE] >> 8) & 0xff,
