@@ -216,6 +216,11 @@ class DomWindow {
     this.#desktop.focus(this);
   }
 
+  /** Whether this window has the keyboard. */
+  get focused() {
+    return this.#desktop.focused() === this;
+  }
+
   /** Give this window a WebGPU canvas of its own for surface `uid`, which the
    * renderer presents into directly (`#gex-gl-<uid>`).
    *
