@@ -1,7 +1,7 @@
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { XGlReadback } from './xgl.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
+import { DwmButtonFades, drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -1355,7 +1355,12 @@ class Compositor {
     const fr = framed ? dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered) : null;
     const ox = fr?.ox ?? 0, oy = fr?.oy ?? 0;
     const W = (fr?.W ?? win.width) + S.l + S.r, H = (fr?.H ?? win.height) + S.t + S.b;
-    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y], active]);
+    if (fr) {
+      win.dwmFades ??= new DwmButtonFades();
+      if (win.dwmFades.update(fr.buttons, performance.now())) this.#fading = true;
+    }
+    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y], active,
+      fr?.buttons.map((b) => b.fade?.t)]);
     let d = win.dwmFrame;
     if (!d || d.canvas.width !== W || d.canvas.height !== H) {
       d?.tex.destroy();
@@ -1478,6 +1483,7 @@ class Compositor {
 
   #lastSig = null;
   #skipped = 0;
+  #fading = false;
 
   // An idle frame (`#still`): what the last frame that acked its blocks
   // drew from -- each block's token and generation, the page's messages
@@ -1514,6 +1520,8 @@ class Compositor {
   #signature() {
     // Not the pointer: the cursor is the page's (`#updateCursor`), not drawn.
     const parts = [this.#outW, this.#outH, this.#focus, this.#order.join(',')];
+    // a caption button cross-fading: every frame until it ends
+    if (this.#fading) parts.push(performance.now());
     for (const [k, win] of this.#windows) {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
@@ -1727,6 +1735,7 @@ class Compositor {
       return;
     }
     this.#lastSig = sig;
+    this.#fading = false;
     // Marks for traces (`console.timeStamp` costs nothing unless tracing).
     console.timeStamp('gex:draw');
     // Nothing to draw into: see `Painter.begin`. The arena is still acked
