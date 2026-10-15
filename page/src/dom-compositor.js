@@ -43,6 +43,7 @@
 // the guest's GL. Such a window gets a WebGPU canvas of its own, laid over its
 // 2D one, and the renderer presents into it -- see `#drawGl` below.
 
+import { attachDwmIcon } from './dwm-frame.js';
 import {
   readScene,
   sceneMarks,
@@ -856,6 +857,8 @@ export class DomDesktop {
     }
     // Glass changed: the page moves its panes and frame, and the whole window
     // is copied again, since which of its pixels are see-through changed.
+    // the caption's icon out of the process's memory (dwm-frame.js)
+    attachDwmIcon(s.glass, this.#memoryOf(s.token));
     const glassSig = s.glass ? JSON.stringify(s.glass) : '';
     if (glassSig !== win.glassSig) {
       win.glassSig = glassSig;

@@ -325,6 +325,10 @@ pub struct SurfaceInfo {
     pub pointer_lock: bool,
     /// Blur-behind and tint (`gex_glass_v1`).
     pub glass: Glass,
+    /// The caption's icon for a frame the host draws (`gex_glass_v1.set_icon`):
+    /// the address of 16 by 16 premultiplied ARGB8888 pixels, rows top down,
+    /// which the surface's state keeps; 0 for none.
+    pub glass_icon: usize,
 }
 
 /// A surface's glass (`protocols/gex-glass-v1.xml`): where the compositor
@@ -520,7 +524,7 @@ pub fn configure_states(states: i32, activated: i32) -> u32 {
 /// Words in one published surface record: the layout a host page reads
 /// (`hosts/browser/js/wl-bridge.mjs`, the same numbers by name), written by
 /// [`push_record`] for a guest's surfaces and the browser X server's alike.
-pub const REC: usize = REC_GLASS + Glass::WORDS;
+pub const REC: usize = REC_GLASS_ICON + 1;
 /// Where the title's UTF-8 bytes start, and how many there are room for.
 pub const REC_TITLE: usize = 38;
 pub const REC_TITLE_BYTES: usize = 256;
@@ -531,6 +535,8 @@ pub const REC_APP_ID_BYTES: usize = 64;
 pub const REC_PID: usize = 118;
 /// [`Glass::record_words`] (`gex_glass_v1`), after every other word.
 pub const REC_GLASS: usize = 119;
+/// [`SurfaceInfo::glass_icon`], after the glass.
+pub const REC_GLASS_ICON: usize = REC_GLASS + Glass::WORDS;
 
 /// `text` into `words` as UTF-8, little-endian, cut on a character boundary
 /// to fit; the rest zero.
@@ -584,6 +590,9 @@ pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[REC_PID] = info.pid as i32;
     // Its glass, if its client asked for some (`gex_glass_v1`).
     r[REC_GLASS..REC_GLASS + Glass::WORDS].copy_from_slice(&info.glass.record_words());
+    // The caption's icon (`gex_glass_v1.set_icon`): where its 256 pixels
+    // are in this process's memory, 0 for none.
+    r[REC_GLASS_ICON] = info.glass_icon as i32;
 }
 
 /// A window-management request a client made of the compositor.
@@ -827,6 +836,9 @@ struct BufferSpec {
 /// effect at `commit`, per Wayland's double-buffered model.
 #[derive(Clone, Debug, Default)]
 struct SurfaceState {
+    /// The caption's icon pixels (`gex_glass_v1.set_icon`); `SurfaceInfo`
+    /// carries their address.
+    glass_icon: Option<Box<[u32]>>,
     pending_buffer: Option<u32>,
     committed_buffer: Option<u32>,
     /// Frame callbacks, delivered after the commit they belong to. A client
@@ -2882,6 +2894,7 @@ impl Client {
             0 => {
                 if let Some(s) = self.surfaces.get_mut(&surface) {
                     s.glass = Glass::default();
+                    s.glass_icon = None;
                     self.dirty = true;
                 }
                 self.objects.remove(&object);
@@ -2923,6 +2936,19 @@ impl Client {
                     self.dirty = true;
                 }
             }
+            // set_icon(pixels): 16 x 16 ARGB8888, or none
+            4 => match r.array() {
+                Some(a) => {
+                    let icon = (a.len() == 16 * 16 * 4).then(|| {
+                        a.chunks_exact(4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect::<Box<[u32]>>()
+                    });
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass_icon = icon;
+                        self.dirty = true;
+                    }
+                }
+                None => ok = false,
+            },
             // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
             2 => match (r.uint(), r.uint(), r.uint(), r.uint(), r.uint()) {
                 (Some(argb), Some(balance), Some(blur_balance), Some(afterglow), Some(afterglow_balance)) => {
@@ -3045,6 +3071,7 @@ impl Client {
                 input: s.input.clone(),
                 pointer_lock: self.wants_lock(*id),
                 glass: s.glass,
+                glass_icon: s.glass_icon.as_ref().map_or(0, |p| p.as_ptr() as usize),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
