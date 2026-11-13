@@ -4939,6 +4939,69 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_glass_reaches_its_record_after_every_other_word() {
+        // placed_window: surface 6, wl_compositor 3. gex_glass_manager_v1 is global 13.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let title = "a window with glass";
+        c.receive(&Writer::new(8, 2).string(title).finish(), &[], &pool);
+        c.receive(&Writer::new(2, 0).uint(13).string("gex_glass_manager_v1").uint(1).new_id(20).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 1).new_id(21).object(surface).finish(), &[], &pool);
+        // wl_compositor.create_region, wl_region.add: a caption band and two sides.
+        c.receive(&Writer::new(3, 1).new_id(22).finish(), &[], &pool);
+        for (x, y, w, h) in [(0, 0, 64, 20), (0, 20, 4, 44), (60, 20, 4, 44)] {
+            c.receive(&Writer::new(22, 1).int(x).int(y).int(w).int(h).finish(), &[], &pool);
+        }
+        c.receive(&Writer::new(21, 1).object(22).finish(), &[], &pool);
+        // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
+        c.receive(&Writer::new(21, 2).uint(0x6b74_b8fc).uint(8).uint(43).uint(0x0074_b8fc).uint(150).finish(), &[], &pool);
+        // set_frame(flags, close, max, min as x, y, w, h, state, then the client area)
+        let mut frame = Writer::new(21, 3).uint(1 | 2);
+        for (x, state) in [(15, 2u32), (-11, 1), (-37, 4)] {
+            frame = frame.int(x).int(0).int(26).int(20).uint(state);
+        }
+        c.receive(&frame.int(4).int(20).int(56).int(40).finish(), &[], &pool);
+        // set_icon: 16 x 16 ARGB8888.
+        let icon: Vec<u8> = (0..16 * 16 * 4).map(|i| i as u8).collect();
+        c.receive(&Writer::new(21, 4).array(&icon).finish(), &[], &pool);
+
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        let mut rec = Vec::new();
+        push_record(&mut rec, 3, &info);
+        assert_eq!(rec.len(), REC);
+        assert!(REC_GLASS > REC_PID && REC_GLASS_ICON == REC_GLASS + Glass::WORDS && REC == REC_GLASS_ICON + 1);
+        let g = &rec[REC_GLASS..REC_GLASS + Glass::WORDS];
+        assert_eq!(g[0], 3, "three rectangles");
+        assert_eq!(&g[3..15], &[0, 0, 64, 20, 0, 20, 4, 44, 60, 20, 4, 44]);
+        assert_eq!(g[1] as u32, 0x6b74_b8fc);
+        assert_eq!(g[2], 8 | 43 << 8 | 100 << 16, "the balances, a byte each, at most 100");
+        assert_eq!(g[19], 1 | 2, "the frame's flags");
+        assert_eq!(&g[20..25], &[15, 0, 26, 20, 2], "close");
+        assert_eq!(g[29], 1, "maximize's state");
+        assert_eq!(g[34], 4, "minimize's state");
+        assert_eq!(g[35] as u32, 0x0074_b8fc, "the afterglow");
+        assert_eq!(&g[36..40], &[4, 20, 56, 40], "the client area");
+        // The icon's address: a wasm32 shim's, so one word (here, a 64-bit
+        // host's, only its low half).
+        assert_ne!(info.glass_icon, 0);
+        assert_eq!(rec[REC_GLASS_ICON], info.glass_icon as i32);
+        // SAFETY: the icon lives in the client's surface state, which `c` holds.
+        let px = unsafe { std::slice::from_raw_parts(info.glass_icon as *const u8, icon.len()) };
+        assert_eq!(px, &icon[..]);
+        // The words before the glass are as they were: the title and the pid.
+        let b: Vec<u8> = rec[REC_TITLE..REC_TITLE + REC_TITLE_BYTES / 4].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(String::from_utf8(b.into_iter().take_while(|&x| x != 0).collect()).unwrap(), title);
+        assert_eq!(rec[REC_PID], 0);
+
+        // destroy: no glass, no icon.
+        c.receive(&Writer::new(21, 0).finish(), &[], &pool);
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        let mut rec = Vec::new();
+        push_record(&mut rec, 3, &info);
+        assert!(rec[REC_GLASS..].iter().all(|&w| w == 0), "glass left after destroy");
+    }
+
+    #[test]
     fn a_title_cut_to_fit_stays_whole_characters() {
         let mut w = [0i32; 2];
         put_text(&mut w, "abcdefg\u{e9}");
