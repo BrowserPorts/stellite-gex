@@ -987,6 +987,15 @@ impl Gl {
                 // This host has one drawable, the pbuffer: every surface
                 // draws into it, and a frame is what it holds at a PRESENT.
                 op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
+                // One GL context serves every guest context here: asked for
+                // another, this host answers with the one it has (index 0),
+                // which the guest takes as "keep using it", and switching
+                // to it is nothing. Both still have to be read, or a
+                // program with two contexts ends its stream at the first.
+                op::CONTEXT_ADD => reply.u32(0),
+                op::CONTEXT_SET_CURRENT => {
+                    let _ = a.u32();
+                }
                 op::PRESENT => {
                     self.presents += 1;
                     present_meter(self.presents);
