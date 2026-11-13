@@ -937,8 +937,8 @@ class Compositor {
       // A cursor's hotspot, in its surface's units (CSS pixels for the page).
       win.hotX = s.relX;
       win.hotY = s.relY;
-      // the caption's icon out of the process's memory (dwm-frame.js)
-      attachDwmIcon(s.glass, this.#memoryOf(s.token));
+      // the caption's icon, where its pixels are (dwm-frame.js)
+      attachDwmIcon(s.glass, this.#pixelsOf(s));
       win.info = s;
       // A configure the client has not acked yet: an interactive resize
       // sends its next size once this clears.

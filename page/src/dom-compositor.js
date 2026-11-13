@@ -857,8 +857,8 @@ export class DomDesktop {
     }
     // Glass changed: the page moves its panes and frame, and the whole window
     // is copied again, since which of its pixels are see-through changed.
-    // the caption's icon out of the process's memory (dwm-frame.js)
-    attachDwmIcon(s.glass, this.#memoryOf(s.token));
+    // the caption's icon, where its pixels are (dwm-frame.js)
+    attachDwmIcon(s.glass, this.#pixelsOf(s));
     const glassSig = s.glass ? JSON.stringify(s.glass) : '';
     if (glassSig !== win.glassSig) {
       win.glassSig = glassSig;

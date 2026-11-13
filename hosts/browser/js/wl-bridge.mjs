@@ -123,8 +123,11 @@ export const R_GLASS_AFTERGLOW = 154;
  *  over the surface. */
 export const R_GLASS_CLIENT = 155;
 /** The caption's icon (`gex_glass_v1.set_icon`): the address in the process's
- *  memory of 16 x 16 premultiplied ARGB8888 pixels, 0 for none. */
+ *  memory of 16 x 16 premultiplied ARGB8888 pixels, 0 for none. With pixel
+ *  buffers, where the proxy copied them in the record's buffer, after the
+ *  surface's own pixels (`ICON_BYTES` more of its region). */
 export const R_GLASS_ICON = 159;
+export const ICON_BYTES = 16 * 16 * 4;
 export const GLASS_FRAME_ON = 1;
 export const GLASS_FRAME_ACTIVE = 2;
 export const GLASS_FRAME_MAXIMIZED = 4;
@@ -831,9 +834,12 @@ export class WlProxy {
    * them: the damaged rows, all of them for a surface with a new region, and
    * none for one whose serial was copied already.
    */
-  #copyPixels(memory, count) {
+  #copyPixels(memory, count, records = memory) {
     if (!this.#pixels) return;
     const a = this.#a;
+    // A surface's region: its pixels, then its caption icon if it has one
+    // (the icon's address is in the records' memory, `records`).
+    const regionOf = (dst) => a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4 + (a[dst + R_GLASS_ICON] ? ICON_BYTES : 0);
     // A buffer that cannot take this publish's new regions is replaced by
     // one that can, with room to spare, and every surface is copied whole.
     // A first one is made for what this publish needs.
@@ -843,7 +849,7 @@ export class WlProxy {
       let all = 0;
       for (let k = 0; k < count; k++) {
         const dst = this.#shmDst[k];
-        const need = ((a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4) + 255) & ~255;
+        const need = (regionOf(dst) + 255) & ~255;
         all += need;
         if (!h) continue;
         let o = -1;
@@ -862,6 +868,7 @@ export class WlProxy {
             const dst = this.#shmDst[k];
             a[dst + R_ADDR] = 0;
             a[dst + R_ADDR_HI] = 0;
+            a[dst + R_GLASS_ICON] = 0;
           }
           return;
         }
@@ -885,7 +892,7 @@ export class WlProxy {
       for (let k = 0; k < count; k++) {
         const dst = this.#shmDst[k];
         const o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
-        const need = a[dst + R_WIDTH] * a[dst + R_HEIGHT] * 4;
+        const need = regionOf(dst);
         if (o < 0 || h[o + 3] < need) more += (need + 255) & ~255;
       }
       if (h[P_NEXT] + more > buf.byteLength) {
@@ -899,7 +906,7 @@ export class WlProxy {
         const rx = this.#shmRect[k * 4], ry = this.#shmRect[k * 4 + 1], rwd = this.#shmRect[k * 4 + 2], rht = this.#shmRect[k * 4 + 3];
         const w = a[dst + R_WIDTH];
         const ht = a[dst + R_HEIGHT];
-        const need = w * ht * 4;
+        const need = regionOf(dst);
         const from = recordAddr(a, dst);
         const stride = a[dst + R_STRIDE];
         let o = find(a[dst + R_CLIENT], a[dst + R_SURFACE]);
@@ -918,6 +925,7 @@ export class WlProxy {
             this.#saidTooBig = true;
             a[dst + R_ADDR] = 0;
             a[dst + R_ADDR_HI] = 0;
+            a[dst + R_GLASS_ICON] = 0;
             continue;
           }
           h[o] = a[dst + R_CLIENT];
@@ -957,6 +965,19 @@ export class WlProxy {
             }
           }
           h[o + 4] = serial;
+        }
+        // The icon, every publish: it changes with no commit (glass state
+        // takes effect at once), and it is 1 KiB.
+        const icon = a[dst + R_GLASS_ICON] >>> 0;
+        if (icon) {
+          const rec = records === memory ? src : this.#bytesOf(records);
+          const to = at + w * ht * 4;
+          if (icon + ICON_BYTES <= rec.length) {
+            this.#bufBytes.set(rec.subarray(icon, icon + ICON_BYTES), to);
+            a[dst + R_GLASS_ICON] = to;
+          } else {
+            a[dst + R_GLASS_ICON] = 0;
+          }
         }
         a[dst + R_ADDR] = at;
         a[dst + R_ADDR_HI] = this.#bufId;
@@ -1163,7 +1184,7 @@ export class WlProxy {
       a[dst + R_DAMAGE_W] = dw;
       a[dst + R_DAMAGE_H] = dh;
     }
-    if (shm) this.#copyPixels(pixels, shm);
+    if (shm) this.#copyPixels(pixels, shm, memory);
     Atomics.store(this.#a, this.#base + B_COUNT, n);
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);
@@ -1376,9 +1397,14 @@ export function mirrorTake(channel, st, memoryOf, force = false) {
       const stride = words[r + R_STRIDE];
       const height = words[r + R_HEIGHT];
       const size = Math.max(0, stride * height);
+      // The caption icon's address, in the same memory; its bytes go after
+      // the pixels in the page's buffer.
+      const icon = words[r + R_GLASS_ICON] >>> 0;
+      words[r + R_GLASS_ICON] = 0;
+      const total = size + (icon ? ICON_BYTES : 0);
       let s = st.surfaces.get(key);
-      if (!s || s.size !== size) {
-        s = { id: st.nextId++, size, serial: -1 };
+      if (!s || s.size !== total) {
+        s = { id: st.nextId++, size: total, serial: -1, icon: null };
         st.surfaces.set(key, s);
       }
       // The pixels the record names: its buffer on the page, past a header.
@@ -1397,6 +1423,16 @@ export function mirrorTake(channel, st, memoryOf, force = false) {
         unread = true;
         continue;
       }
+      if (icon && icon + ICON_BYTES <= mem.length) {
+        words[r + R_GLASS_ICON] = MIRROR_AT + size;
+        const now = mem.subarray(icon, icon + ICON_BYTES);
+        if (!s.icon || s.icon.some((v, i) => v !== now[i])) {
+          s.icon = now.slice();
+          const bytes = now.slice();
+          pixels.push([s.id, token, MIRROR_AT + total, MIRROR_AT + size, bytes]);
+          transfer.push(bytes.buffer);
+        }
+      }
       const serial = words[r + R_SERIAL] >>> 0;
       if (serial === s.serial) continue;
       // The damaged rows: all of them the first time, after a commit missed,
@@ -1407,7 +1443,7 @@ export function mirrorTake(channel, st, memoryOf, force = false) {
       const y1 = whole ? height : Math.max(y0, Math.min(height, words[r + R_DAMAGE_Y] + words[r + R_DAMAGE_H]));
       if (y1 <= y0) continue;
       const bytes = mem.slice(addr + y0 * stride, addr + y1 * stride);
-      pixels.push([s.id, token, MIRROR_AT + size, MIRROR_AT + y0 * stride, bytes]);
+      pixels.push([s.id, token, MIRROR_AT + total, MIRROR_AT + y0 * stride, bytes]);
       transfer.push(bytes.buffer);
     }
     if (unread) st.gens[was + 1] = gen - 1;
