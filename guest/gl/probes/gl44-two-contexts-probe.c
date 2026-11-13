@@ -16,14 +16,13 @@
  * so whatever it answers is what GL requires.
  *
  * **Expected result: 8/8 against the reference, 7/8 in the browser.** The one
- * failure is `unshared_context_cannot_see_the_buffer` and it is a known,
- * documented gap rather than a regression -- see the tail of this file and
- * docs/gl-webgpu-handoff.md. Gate it with
+ * failure is `unshared_context_cannot_see_the_buffer` and it is a known gap
+ * rather than a regression -- see the tail of this file. test/gl/probes.test.js
+ * lists it (KNOWN) by the line the browser ends with,
  *
- *   GEX_PROBE_EXPECT='SUMMARY cases=8 passed=7 failed=1' \
- *       tests/gl44-probe.sh two-contexts
+ *   SUMMARY cases=8 passed=7 failed=1
  *
- * and it will fail the moment either half changes: if object isolation is
+ * and fails the moment either half changes: if object isolation is
  * implemented the count goes up, and if per-context *state* regresses it goes
  * down. That is the point of leaving it here failing.
  */
