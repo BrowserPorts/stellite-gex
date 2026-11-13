@@ -18,7 +18,7 @@
 // A frame the compositor draws (`gex_glass_v1.set_frame`: the client's
 // window system left its frame to DWM) is a second canvas above the window's:
 // the frame pieces, the caption text on its glow and the caption buttons, out
-// of DWM's atlas from the user's own aero.msstyles (tools/aero/
+// of DWM's atlas from the user's own aero.msstyles (scripts/aero/
 // extract-dwm-frame.py, served at /gex/aero/). Without the atlas, the glass
 // has no frame artwork and the caption text is drawn alone.
 

@@ -108,6 +108,9 @@ const frame = params.get('frame') === '0' ? null : [1 | 2,
 rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1, title: 'Computer', frame,
   glass: glassOn ? [[0, 0, W, 30], [0, 30, 8, H - 38], [W - 8, 30, 8, H - 38], [0, H - 8, W, 8]] : null });
 const proxy = new WlProxy(channel, null, () => TOKEN);
+// With pixel buffers (makeWlChannel's) the compositor reads the copies the
+// proxy makes, as a guest Worker posts them ('wl-pixels'), not the memory.
+proxy.onPixels = ({ token, id, buffer, replaces }) => comp.addPixels(token, id, buffer, replaces);
 proxy.publish(memory, 1024, 2);
 window.published = true;
 </script>

@@ -2,7 +2,7 @@
 // symbols: CTopLevelWindow's UpdatePinnedParts, UpdateHighlights,
 // UpdateEnvironmentMapViewPort, UpdateNCAreaPositionsAndSizes, CText,
 // CButton), drawn with a 2D context out of DWM's atlas from the user's own
-// aero.msstyles (tools/aero/extract-dwm-frame.py's dwm-atlas.png and
+// aero.msstyles (scripts/aero/extract-dwm-frame.py's dwm-atlas.png and
 // dwm-parts.json).
 //
 // Back to front, all under the window's client area (which covers them):

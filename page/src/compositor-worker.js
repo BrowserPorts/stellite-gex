@@ -1319,7 +1319,7 @@ class Compositor {
 
   // -- Windows 7's frame, from the user's own aero.msstyles ----------------
   //
-  // tools/aero/extract-dwm-frame.py pulls DWM's frame atlas and its parts out
+  // scripts/aero/extract-dwm-frame.py pulls DWM's frame atlas and its parts out
   // of a Windows 7 aero.msstyles; a page that has them serves them at
   // /gex/aero/. Without them, glass is drawn with no frame artwork.
   #aero = null; // null: not tried; false: none; else { img, parts }
