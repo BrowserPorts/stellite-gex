@@ -270,12 +270,12 @@ struct st_context* mesa_context = nullptr;
  * has been getting it. Separating the namespaces without implementing sharing
  * would break exactly those programs. Sharing everything keeps them working
  * while the per-context *state* becomes real, which is the part that is
- * observably wrong. */
+ * observably wrong.
+ *
+ * Per client, as mesa_context is (swap_client_state), and destroyed with it
+ * (destroy_backend_contexts). */
 std::vector<struct st_context*> mesa_contexts;
 unsigned mesa_current_context = 0;
-/* The visual every context's default framebuffer has, filled in by
-   create_backend_context and reused by CONTEXT_ADD. */
-struct st_visual mesa_visual = {};
 
 /* The default framebuffer.
  *
@@ -625,6 +625,8 @@ struct client_state {
     int backend_height = 1;
     unsigned attached_kind = 0, attached_id = 0, attached_token = 0;
     struct st_context* mesa_context = nullptr;
+    std::vector<struct st_context*> mesa_contexts;
+    unsigned mesa_current_context = 0;
     /* A Gallium screen each: see `ensure_screen`. */
     struct pipe_frontend_screen mesa_frontend_screen = {};
 #if !defined(GEX_MESA_WGPU)
@@ -673,6 +675,8 @@ void swap_client_state(client_state& other) {
     std::swap(attached_id, other.attached_id);
     std::swap(attached_token, other.attached_token);
     std::swap(mesa_context, other.mesa_context);
+    std::swap(mesa_contexts, other.mesa_contexts);
+    std::swap(mesa_current_context, other.mesa_current_context);
     std::swap(mesa_frontend_screen, other.mesa_frontend_screen);
 #if !defined(GEX_MESA_WGPU)
     std::swap(mesa_winsys, other.mesa_winsys);
@@ -758,6 +762,20 @@ void use_client(uint32_t client) {
          * took over were filed under the window of the one that left. */
         note_surface_to_backend(into->uid);
     }
+}
+
+/* Let go of this client's GL contexts: the additional ones first, then the
+ * first, which they share objects with. Whichever was current, mesa_context
+ * is one of them. */
+void destroy_backend_contexts() {
+    for (size_t i = mesa_contexts.size(); i-- > 0;)
+        if (mesa_contexts[i])
+            st_destroy_context(mesa_contexts[i]);
+    if (mesa_contexts.empty() && mesa_context)
+        st_destroy_context(mesa_context);
+    mesa_contexts.clear();
+    mesa_current_context = 0;
+    mesa_context = nullptr;
 }
 
 #if defined(GEX_MESA_WGPU)
@@ -1204,12 +1222,7 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
     /* A visual the guest's default framebuffer can actually be: a colour
      * buffer it draws to and a depth/stencil buffer, both at the size the
      * transport was given. */
-    /* Kept at file scope as mesa_visual, because CONTEXT_ADD creates its
-       context with the same one: a second context whose default framebuffer
-       had a different shape would not be sharing the drawable this one is
-       made current with. */
-    struct st_visual& visual = mesa_visual;
-    visual = st_visual{};
+    struct st_visual visual = {};
     visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK |
                          ST_ATTACHMENT_BACK_LEFT_MASK |
                          ST_ATTACHMENT_DEPTH_STENCIL_MASK;
@@ -2139,10 +2152,7 @@ bool one(uint32_t op, Reader& a) {
          * next `CONTEXT_CREATE` is then a creation rather than a no-op --
          * which is what lets a toolkit read the GL strings through a
          * throwaway context and still get the profile it asks for after. */
-        if (mesa_context) {
-            st_destroy_context(mesa_context);
-            mesa_context = nullptr;
-        }
+        destroy_backend_contexts();
         reset_guest_namespace();
         for (auto& entry : surfaces) {
             for (struct pipe_resource*& attachment : entry.second.drawable.attachments)
@@ -2824,7 +2834,6 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case CONTEXT_ADD: {
-#if defined(GEX_MESA_WASM)
         /* An additional context, sharing objects with the first. Replies with
            its index, or with 0 when another cannot be made -- index 0 always
            exists, so a guest that gets it back simply keeps using the context
@@ -2833,15 +2842,20 @@ bool one(uint32_t op, Reader& a) {
             put_u32(0u);
             break;
         }
+        struct st_context* first = mesa_contexts[0];
         struct st_context_attribs attribs = {};
-        attribs.visual = mesa_visual;
-        attribs.major = mesa_contexts[0]->ctx->Version / 10;
-        attribs.minor = mesa_contexts[0]->ctx->Version % 10;
-        attribs.profile = mesa_contexts[0]->ctx->API == API_OPENGL_CORE
-            ? API_OPENGL_CORE : API_OPENGL_COMPAT;
+        /* The visual every drawable of this client is built with, so the
+           added context can be made current against the same ones. */
+        attribs.visual = backend_visual;
+        attribs.major = first->ctx->Version / 10;
+        attribs.minor = first->ctx->Version % 10;
+        /* The first context's API, so an ES one is added as ES and a core one
+           as core, with the options it was given. */
+        attribs.profile = first->ctx->API;
+        attribs.options = first->options;
         enum st_context_error error = ST_CONTEXT_SUCCESS;
         struct st_context* added = st_api_create_context(
-            &mesa_frontend_screen, &attribs, &error, mesa_contexts[0]);
+            &mesa_frontend_screen, &attribs, &error, first);
         if (!added) {
             fprintf(stderr, "gexgl: could not create an additional GL "
                             "context (error %d); the guest keeps the one it "
@@ -2851,15 +2865,11 @@ bool one(uint32_t op, Reader& a) {
         }
         mesa_contexts.push_back(added);
         put_u32((uint32_t)(mesa_contexts.size() - 1));
-#else
-        put_u32(0u);
-#endif
         break;
     }
     case CONTEXT_SET_CURRENT: {
         const uint32_t want = a.u32();
         if (!a.ok) break;
-#if defined(GEX_MESA_WASM)
         if (want >= mesa_contexts.size()) {
             static bool said;
             if (!said) {
@@ -2881,9 +2891,6 @@ bool one(uint32_t op, Reader& a) {
         mesa_current_context = want;
         /* Everything downstream reads mesa_context, so it has to follow. */
         mesa_context = mesa_contexts[want];
-#else
-        (void)want;
-#endif
         break;
     }
     case GET_ERROR: put_u32(glGetError()); break;
@@ -3285,10 +3292,7 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
      * empty and this looped for ever in the compositor's Worker, which then
      * drew nothing and answered nothing (the second glxgears of a session,
      * whichever way it was started). */
-    if (mesa_context) {
-        st_destroy_context(mesa_context);
-        mesa_context = nullptr;
-    }
+    destroy_backend_contexts();
     sur = nullptr;
     while (!surfaces.empty()) drop_surface(surfaces.begin()->first, false);
     current_surface = 0;

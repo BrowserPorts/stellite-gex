@@ -1875,6 +1875,9 @@ static int vertex_attrib_client_count;
  * for whatever came last. */
 struct gexgl_vao_state {
     unsigned name;
+    /* Only for the default VAO (name 0), which every context has its own of;
+       other names are allocated by this library and are unique. */
+    unsigned context;
     void *pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
     struct vertex_attrib_state attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
     int client_count;
@@ -1882,17 +1885,22 @@ struct gexgl_vao_state {
 };
 static struct gexgl_vao_state *gexgl_vaos;
 static unsigned gexgl_current_vao;   /* 0 is the default VAO, which is real */
+/* Which GL context is current, as an index into the EGL context slots
+   (egl_context_slots); it says whose default VAO "0" is. */
+static unsigned gexgl_vao_context;
 
 static struct gexgl_vao_state *gexgl_vao(unsigned name, int create) {
     struct gexgl_vao_state *vao = gexgl_vaos;
     while (vao) {
-        if (vao->name == name) return vao;
+        if (vao->name == name && (name != 0 || vao->context == gexgl_vao_context))
+            return vao;
         vao = vao->next;
     }
     if (!create) return NULL;
     vao = calloc(1, sizeof(*vao));
     if (!vao) return NULL;
     vao->name = name;   /* name 0 included: the default VAO has state too */
+    vao->context = name == 0 ? gexgl_vao_context : 0;
     vao->next = gexgl_vaos;
     gexgl_vaos = vao;
     return vao;
@@ -1937,6 +1945,21 @@ static void gexgl_vao_forget(unsigned name) {
     /* GL reverts to the default VAO when the bound one is deleted. */
     if (name == gexgl_current_vao && name != 0)
         gexgl_vao_switch_to(0);
+}
+
+/* A context's default VAO goes with it; a context made in its slot later
+   starts from the defaults. */
+static void gexgl_vao_drop_default(unsigned context) {
+    struct gexgl_vao_state **link = &gexgl_vaos;
+    while (*link) {
+        if ((*link)->name == 0 && (*link)->context == context) {
+            struct gexgl_vao_state *gone = *link;
+            *link = gone->next;
+            free(gone);
+            continue;
+        }
+        link = &(*link)->next;
+    }
 }
 
 /* Bytes one attribute occupies, ignoring stride. */
@@ -3932,56 +3955,91 @@ static void *egl_current_context;
  * ignored, which is wrong for a program that asks for an *unshared* context;
  * it is the same wrong as before rather than a new one, and separating the
  * namespaces without implementing sharing would break the toolkits that have
- * been getting sharing by accident. */
+ * been getting sharing by accident.
+ *
+ * A slot is the context's from eglCreateContext to eglDestroyContext, and is
+ * then free for the next: a program that makes and drops contexts as it goes
+ * does not run out of them. The host's first context is made for whichever
+ * slot is current when something first needs it (host_realize), with what
+ * that context asked for; the others get theirs from CONTEXT_ADD when they
+ * first become current after that.
+ *
+ * A GLX program made through glXCreateContextAttribsARB has no slot:
+ * glXMakeCurrent makes the host context itself and names it (void *)3, so its
+ * contexts stay one. */
 #define GEXGL_FIRST_CONTEXT_HANDLE ((void *)3)
 #define GEXGL_MAX_GUEST_CONTEXTS 8
+/* egl_context_current_slot when no slot's state is the live one: none made
+   current yet, or the one that was has been destroyed. */
+#define GEXGL_NO_CONTEXT_SLOT (~0u)
 
 struct gexgl_context_slot {
     void *handle;            /* what eglCreateContext returned */
+    int in_use;              /* between eglCreateContext and eglDestroyContext */
+    /* What it asked for, which the host's first context is made with when
+       this is the context current at the time (host_realize). */
+    unsigned api;
+    int major, minor, profile;
     unsigned host_index;     /* the host's context, 0 for the first */
     int host_made;           /* whether the host has a context for it */
     /* The caches, parked while another context is current. */
     struct gexgl_pixel_store pack, unpack;
     struct buffer_target_state buffer_targets[sizeof(buffer_targets) / sizeof(buffer_targets[0])];
+    void *vertex_attrib_pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
     struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
     int vertex_attrib_client_count;
+    unsigned current_vao;
     struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
     int ff_client_count;
     unsigned client_active_texture;
 };
 static struct gexgl_context_slot egl_context_slots[GEXGL_MAX_GUEST_CONTEXTS];
-static unsigned egl_context_count;
-static unsigned egl_context_current_slot;
+static unsigned egl_context_current_slot = GEXGL_NO_CONTEXT_SLOT;
+/* The host context the host has current: CONTEXT_CREATE makes it 0, and only
+   CONTEXT_SET_CURRENT changes it, so a program with one context never sends
+   one. */
+static unsigned host_current_index;
 
 /* Park the live caches in a slot, and take a slot's caches live. Swapping the
    globals rather than threading a context pointer through every access site is
    what keeps this change small: nothing that reads pack_store or
-   vertex_attribs has to know a context switch can happen. */
+   vertex_attribs has to know a context switch can happen.
+
+   The attribute arrays are the bound VAO's, so the VAO goes with them: which
+   one is bound is per context, and so is the default one (gexgl_vao_context
+   says whose "0" is). */
 static void gexgl_context_save(struct gexgl_context_slot *slot) {
     slot->pack = pack_store;
     slot->unpack = unpack_store;
     memcpy(slot->buffer_targets, buffer_targets, sizeof(buffer_targets));
+    memcpy(slot->vertex_attrib_pointers, vertex_attrib_pointers, sizeof(vertex_attrib_pointers));
     memcpy(slot->vertex_attribs, vertex_attribs, sizeof(vertex_attribs));
     slot->vertex_attrib_client_count = vertex_attrib_client_count;
+    slot->current_vao = gexgl_current_vao;
     memcpy(slot->ff_arrays, ff_arrays, sizeof(ff_arrays));
     slot->ff_client_count = ff_client_count;
     slot->client_active_texture = client_active_texture;
 }
 
-static void gexgl_context_load(const struct gexgl_context_slot *slot) {
+static void gexgl_context_load(const struct gexgl_context_slot *slot, unsigned index) {
     pack_store = slot->pack;
     unpack_store = slot->unpack;
     memcpy(buffer_targets, slot->buffer_targets, sizeof(buffer_targets));
+    memcpy(vertex_attrib_pointers, slot->vertex_attrib_pointers, sizeof(vertex_attrib_pointers));
     memcpy(vertex_attribs, slot->vertex_attribs, sizeof(vertex_attribs));
     vertex_attrib_client_count = slot->vertex_attrib_client_count;
+    gexgl_current_vao = slot->current_vao;
+    gexgl_vao_context = index;
     memcpy(ff_arrays, slot->ff_arrays, sizeof(ff_arrays));
     ff_client_count = slot->ff_client_count;
     client_active_texture = slot->client_active_texture;
 }
 
 /* A fresh context starts at GL's defaults, not at whatever the last one left.
-   Only the two pixel-store blocks have non-zero defaults. */
-static void gexgl_context_defaults(struct gexgl_context_slot *slot) {
+   Only the two pixel-store blocks have non-zero defaults. What the slot says
+   about the host's context is kept: a slot is reused with the host context it
+   had, as the host has no way to drop one short of dropping them all. */
+static void gexgl_context_defaults(struct gexgl_context_slot *slot, unsigned index) {
     void *handle = slot->handle;
     const unsigned host = slot->host_index;
     const int made = slot->host_made;
@@ -3991,13 +4049,64 @@ static void gexgl_context_defaults(struct gexgl_context_slot *slot) {
     slot->host_made = made;
     slot->pack = (struct gexgl_pixel_store){4, 0, 0, 0, 0, 0};
     slot->unpack = (struct gexgl_pixel_store){4, 0, 0, 0, 0, 0};
+    gexgl_vao_drop_default(index);
+}
+
+static struct gexgl_context_slot *gexgl_context_slot_of(void *handle, unsigned *index) {
+    if (!handle) return NULL;
+    for (unsigned i = 0; i < GEXGL_MAX_GUEST_CONTEXTS; ++i) {
+        if (egl_context_slots[i].in_use && egl_context_slots[i].handle == handle) {
+            if (index) *index = i;
+            return &egl_context_slots[i];
+        }
+    }
+    return NULL;
+}
+
+/* A new EGLContext, in the first free slot, with what eglCreateContext was
+   asked for. The first slot's handle is the one this library has always
+   returned, so an application with one context sees no change. */
+static void *gexgl_context_new(void) {
+    unsigned i = 0;
+    while (i < GEXGL_MAX_GUEST_CONTEXTS && egl_context_slots[i].in_use) ++i;
+    if (i == GEXGL_MAX_GUEST_CONTEXTS) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gex-gl: more than %d GL contexts; the newest "
+                            "share the last one's state\n",
+                    GEXGL_MAX_GUEST_CONTEXTS);
+        }
+        return egl_context_slots[GEXGL_MAX_GUEST_CONTEXTS - 1].handle;
+    }
+    struct gexgl_context_slot *slot = &egl_context_slots[i];
+    slot->handle = i == 0 ? GEXGL_FIRST_CONTEXT_HANDLE
+                          : (void *)(uintptr_t)(0x3000u + i);
+    gexgl_context_defaults(slot, i);
+    slot->in_use = 1;
+    slot->api = egl_api;
+    slot->major = egl_context_major;
+    slot->minor = egl_context_minor;
+    slot->profile = egl_context_profile;
+    return slot->handle;
+}
+
+/* Whether a slot has the host's first context. Not when it was made with no
+   slot current -- a surface's resize made it before any eglMakeCurrent -- and
+   then the next slot to need one takes it rather than adding another. */
+static int gexgl_host_first_taken(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_GUEST_CONTEXTS; ++i)
+        if (egl_context_slots[i].host_made && egl_context_slots[i].host_index == 0)
+            return 1;
+    return 0;
 }
 
 static void gexgl_context_switch_to(unsigned slot_index) {
-    if (slot_index >= egl_context_count ||
+    if (slot_index >= GEXGL_MAX_GUEST_CONTEXTS ||
         slot_index == egl_context_current_slot)
         return;
-    gexgl_context_save(&egl_context_slots[egl_context_current_slot]);
+    if (egl_context_current_slot != GEXGL_NO_CONTEXT_SLOT)
+        gexgl_context_save(&egl_context_slots[egl_context_current_slot]);
     struct gexgl_context_slot *to = &egl_context_slots[slot_index];
     /* The host side, first time only: an additional GL context sharing the
        first's objects. A host that cannot make one replies with index zero,
@@ -4009,7 +4118,10 @@ static void gexgl_context_switch_to(unsigned slot_index) {
        current when it runs, so a switch before anything has drawn costs the
        host nothing. */
     if (host_context_made) {
-        if (!to->host_made) {
+        if (!to->host_made && !gexgl_host_first_taken()) {
+            to->host_made = 1;
+            to->host_index = 0;
+        } else if (!to->host_made) {
             to->host_made = 1;
             uint32_t *p = begin(GEXGL_CONTEXT_ADD, 0, 0);
             if (p) {
@@ -4017,9 +4129,19 @@ static void gexgl_context_switch_to(unsigned slot_index) {
                 to->host_index = reply_u32();
             }
         }
-        CMD1(GEXGL_CONTEXT_SET_CURRENT, to->host_index);
+        if (to->host_index != host_current_index) {
+            CMD1(GEXGL_CONTEXT_SET_CURRENT, to->host_index);
+            host_current_index = to->host_index;
+        }
+    } else {
+        /* What the host's first context will be made with, if it is made
+           while this one is current. */
+        egl_api = to->api;
+        egl_context_major = to->major;
+        egl_context_minor = to->minor;
+        egl_context_profile = to->profile;
     }
-    gexgl_context_load(to);
+    gexgl_context_load(to, slot_index);
     egl_context_current_slot = slot_index;
 }
 static void *egl_current_draw;
@@ -4381,11 +4503,13 @@ static void host_realize(void) {
     /* A new first host context, and the only one: it belongs to the slot that
        is current now, and any slot given one before (CONTEXT_ADD, ahead of an
        eglDestroyContext that took them all) has none. */
-    for (unsigned i = 0; i < egl_context_count; ++i) {
+    for (unsigned i = 0; i < GEXGL_MAX_GUEST_CONTEXTS; ++i) {
         egl_context_slots[i].host_made = 0;
         egl_context_slots[i].host_index = 0;
     }
-    if (egl_context_count) egl_context_slots[egl_context_current_slot].host_made = 1;
+    if (egl_context_current_slot != GEXGL_NO_CONTEXT_SLOT)
+        egl_context_slots[egl_context_current_slot].host_made = 1;
+    host_current_index = 0;
     shadow_context_made();
     uint32_t *p = begin(GEXGL_CONTEXT_CREATE, 4, 0);
     if (!p) return;
@@ -4931,38 +5055,7 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     /* Counted, and the host's context left to be made when something needs
        it (context_create, host_realize). */
     context_create();
-    /* The first context keeps the handle this function has always returned,
-       so an application with one context sees no change at all -- and every
-       program in the app sweep has one. A second gets a distinct handle,
-       which it has to: two contexts that compare equal made every
-       eglMakeCurrent between them a no-op, which is how their state came to
-       be shared. */
-    if (egl_context_count == 0) {
-        egl_context_slots[0].handle = GEXGL_FIRST_CONTEXT_HANDLE;
-        egl_context_slots[0].host_index = 0;
-        egl_context_slots[0].host_made = host_context_made;
-        gexgl_context_defaults(&egl_context_slots[0]);
-        egl_context_count = 1;
-        egl_context_current_slot = 0;
-        return GEXGL_FIRST_CONTEXT_HANDLE;
-    }
-    if (egl_context_count >= GEXGL_MAX_GUEST_CONTEXTS) {
-        static int said;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "gex-gl: more than %d GL contexts; the newest "
-                            "share the last one's state\n",
-                    GEXGL_MAX_GUEST_CONTEXTS);
-        }
-        return egl_context_slots[GEXGL_MAX_GUEST_CONTEXTS - 1].handle;
-    }
-    const unsigned slot = egl_context_count++;
-    egl_context_slots[slot].handle =
-        (void *)(uintptr_t)(0x3000u + slot);
-    egl_context_slots[slot].host_index = 0;
-    egl_context_slots[slot].host_made = 0;
-    gexgl_context_defaults(&egl_context_slots[slot]);
-    return egl_context_slots[slot].handle;
+    return gexgl_context_new();
 }
 
 /* Really destroy it, so the next context is created rather than latched.
@@ -4976,7 +5069,19 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
  * Only the last one: an application that keeps two contexts and destroys one
  * is not asking for the other's to go. */
 unsigned eglDestroyContext(void *dpy, void *ctx) {
-    (void)dpy; (void)ctx;
+    (void)dpy;
+    /* Its slot is free for the next eglCreateContext. A host context it was
+       given (CONTEXT_ADD) stays with the slot and is reused. If it was the
+       current one, the live caches are its and nobody else's: the next
+       context made current loads its own rather than saving these over a
+       slot that may by then be another context's. */
+    unsigned gone_index = 0;
+    struct gexgl_context_slot *gone = gexgl_context_slot_of(ctx, &gone_index);
+    if (gone) {
+        gone->in_use = 0;
+        if (gone_index == egl_context_current_slot)
+            egl_context_current_slot = GEXGL_NO_CONTEXT_SLOT;
+    }
     if (!host_context_made || egl_contexts_live > 1) {
         if (egl_contexts_live) egl_contexts_live--;
         /* The last of them gone before any drew: the host never made one. */
@@ -4985,6 +5090,11 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
     }
     egl_contexts_live = 0;
     host_context_made = 0;
+    /* CONTEXT_DESTROY below takes every host context with it. */
+    for (unsigned i = 0; i < GEXGL_MAX_GUEST_CONTEXTS; ++i) {
+        egl_context_slots[i].host_made = 0;
+        egl_context_slots[i].host_index = 0;
+    }
     egl_current_context = NULL;
     shadow_report();
     shadow_forget_matrices();
@@ -5007,17 +5117,13 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        then stood in for the one it really wanted). */
     if (ctx && !host_context_made && !host_deferred) context_create();
     /* Switch the cached state and the host's context when the application
-       moves between two of them. A single-context program never gets here
-       with anything but slot zero, so its path is unchanged. Before the host
-       context is made below, so that it is made for the context now current. */
-    if (ctx) {
-        for (unsigned i = 0; i < egl_context_count; ++i) {
-            if (egl_context_slots[i].handle == ctx) {
-                gexgl_context_switch_to(i);
-                break;
-            }
-        }
-    }
+       moves between two of them (gexgl_context_switch_to). Before the host
+       context is made below, so that it is made for the context now current
+       and with what that one asked for. A handle this library did not hand
+       out -- a GLX program's (void *)3 with no slot -- switches nothing. */
+    unsigned slot_index = 0;
+    if (ctx && gexgl_context_slot_of(ctx, &slot_index))
+        gexgl_context_switch_to(slot_index);
     /* Drawing into a surface: the host's context is needed now. */
     if (ctx && draw) host_realize();
     egl_current_display = ctx ? dpy : NULL;
