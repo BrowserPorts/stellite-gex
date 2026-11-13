@@ -246,6 +246,8 @@ class Painter {
     this.groups = new WeakMap();
     this.scene = null;
     this.keep = false;
+    /** This frame is drawn into `scene` and copied to the canvas (`begin`). */
+    this.viaScene = false;
   }
 
   #group(tex, nearest) {
@@ -265,14 +267,16 @@ class Painter {
     return g;
   }
 
-  begin(w, h) {
+  begin(w, h, { glass = false } = {}) {
     // A WebGPU canvas is drawn straight into, in one pass: its texture is
     // written by nothing else. Once a read has asked for the output (a
     // harness, `describe`), the scene is drawn into a texture of its own and
     // copied to the canvas, so it can be read back after the canvas texture
-    // has been presented.
+    // has been presented. So is a frame with glass in it: `glass` copies
+    // what is drawn so far out of the scene to blur it.
     let target;
-    if (this.context && !this.keep) {
+    this.viaScene = !this.context || this.keep || glass;
+    if (!this.viaScene) {
       target = this.context.getCurrentTexture();
     } else {
       if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
@@ -385,7 +389,7 @@ class Painter {
   end() {
     this.pass.end();
     if (this.n) this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
-    if (this.context && this.keep) {
+    if (this.context && this.viaScene) {
       const out = this.context.getCurrentTexture();
       this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
     }
@@ -1635,7 +1639,9 @@ class Compositor {
     console.timeStamp('gex:draw');
     // Nothing to draw into: see `Painter.begin`. The arena is still acked
     // below on the next frame that works, so a restored context catches up.
-    if (this.#painter.begin(this.#outW, this.#outH) === false) {
+    let glass = false;
+    for (const win of this.#windows.values()) glass ||= !!win.info?.glass;
+    if (this.#painter.begin(this.#outW, this.#outH, { glass }) === false) {
       this.#lastSig = null;
       return;
     }
