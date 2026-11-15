@@ -1981,6 +1981,37 @@ mod tests {
         assert_eq!(&pixels[(2 * 64 + 2) * 4..(2 * 64 + 2) * 4 + 4], &[0, 255, 0, 255], "the indexed triangle");
     }
 
+    /// A guest with a second EGL context sends CONTEXT_ADD and
+    /// CONTEXT_SET_CURRENT. This host has one GL context for all of them: it
+    /// answers CONTEXT_ADD with that one (index 0), switching is nothing, and
+    /// the stream goes on -- an unknown opcode would end it there.
+    #[test]
+    fn a_second_guest_context_is_the_one_context_and_the_stream_goes_on() {
+        let _serial = gl_lock();
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
+        b.cmd(op::CONTEXT_ADD, &[]);
+        b.cmd(op::CONTEXT_SET_CURRENT, &[1]);
+        b.cmd(op::CONTEXT_SET_CURRENT, &[0]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        for _ in 0..3 {
+            read_blob(r, &mut at); // vendor, renderer, version
+        }
+        assert_eq!(read_u32(r, &mut at), 0, "CONTEXT_ADD: the one context there is");
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+    }
+
     /// The whole path: bring up a context, compile the application's own
     /// GLSL, upload vertices, draw, read the pixels back.
     ///
