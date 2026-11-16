@@ -248,6 +248,10 @@ pub mod raw {
     pub const EVENTFD2: u64 = 328;
     pub const SIGNALFD: u64 = 321;
     pub const SIGNALFD4: u64 = 327;
+    pub const IPC: u64 = 117;
+    pub const SEMGET: u64 = 393;
+    pub const SEMCTL: u64 = 394;
+    pub const SEMTIMEDOP_TIME64: u64 = 420;
     pub const INOTIFY_INIT: u64 = 291;
     pub const INOTIFY_ADD_WATCH: u64 = 292;
     pub const INOTIFY_RM_WATCH: u64 = 293;
@@ -1016,6 +1020,47 @@ pub fn translate(
             *a = [sext(a[0]), a[1], a[2], 0, 0, 0];
             nr::SIGNALFD4
         }
+        // ipc(call, first, second, third, ptr, fifth): the System V calls
+        // multiplexed, as glibc for i386 makes them on kernels before 5.1.
+        // The semaphore ones are served (crate::sysv); shared memory and
+        // message queues are not.
+        x::IPC => match a[0] & 0xffff {
+            // semop(first, ptr, second)
+            1 => {
+                *a = [a[1], a[4], a[2], 0, 0, 0];
+                nr::SEMTIMEDOP
+            }
+            // semget(first, second, third)
+            2 => {
+                *a = [a[1], a[2], a[3], 0, 0, 0];
+                nr::SEMGET
+            }
+            // semctl(first, second, third, *ptr): the union's one word.
+            3 => {
+                let arg = if a[4] != 0 { m.read_u32(a[4]).unwrap_or(0) as u64 } else { 0 };
+                *a = [a[1], a[2], a[3], arg, 0, 0];
+                nr::SEMCTL
+            }
+            // semtimedop(first, ptr, second, fifth): a 32-bit timespec,
+            // widened into the scratch.
+            4 => {
+                let ts = if a[5] != 0 {
+                    let secs = m.read_u32(a[5]).unwrap_or(0) as i32 as i64 as u64;
+                    let nanos = m.read_u32(a[5] + 4).unwrap_or(0) as u64;
+                    let _ = m.write_u64(scratch, secs);
+                    let _ = m.write_u64(scratch + 8, nanos);
+                    scratch
+                } else {
+                    0
+                };
+                *a = [a[1], a[4], a[2], ts, 0, 0];
+                nr::SEMTIMEDOP
+            }
+            _ => UNKNOWN,
+        },
+        x::SEMGET => nr::SEMGET,
+        x::SEMCTL => nr::SEMCTL,
+        x::SEMTIMEDOP_TIME64 => nr::SEMTIMEDOP,
         x::INOTIFY_INIT => {
             *a = [0; 6];
             nr::INOTIFY_INIT1

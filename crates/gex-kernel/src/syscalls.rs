@@ -127,6 +127,11 @@ pub mod nr {
     /// `signalfd4` (crate::signalfd); i386's and x86-64's `signalfd` is it
     /// with no flags.
     pub const SIGNALFD4: u64 = 74;
+    /// System V semaphores (crate::sysv).
+    pub const SEMGET: u64 = 190;
+    pub const SEMCTL: u64 = 191;
+    pub const SEMTIMEDOP: u64 = 192;
+    pub const SEMOP: u64 = 193;
     pub const RT_SIGPENDING: u64 = 136;
     pub const RT_SIGRETURN: u64 = 139;
     pub const SIGALTSTACK: u64 = 132;
@@ -686,6 +691,12 @@ pub struct Kernel {
     /// the host has granted it, the file's shared mappings are brought up
     /// to date ([`sync_shared_file`]), as the call itself does.
     pub retry_lock: Option<i32>,
+    /// A semaphore operation that could not proceed slept (`BlockOp::Sleep`):
+    /// [`Kernel::finish_blocking`] makes the call again.
+    pub retry_sem: bool,
+    /// A semaphore operation's answer, made in [`Kernel::blocking_op`] and
+    /// given by the dispatch.
+    pub sem_result: Option<SysResult>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
     /// enters with `int 0x80`, and its numbering and structures are the i386
     /// ones (see `crate::i386`). Set at exec from the image's class,
@@ -7741,8 +7752,14 @@ fn nosys_call(raw: u64, compat: bool) -> Option<FreeCall> {
     if matches!(n, nr::EXECVE | nr::CLONE | nr::CLONE3) {
         return None;
     }
-    // signalfd reads the process's signals, which only the full call has.
-    if n == nr::SIGNALFD4 {
+    // signalfd reads the process's signals, which only the full call has;
+    // the System V semaphores wait by sleeping and making the call again
+    // (`Kernel::finish_blocking`), which only the full call does; and i386's
+    // `ipc` reads its arguments out of memory into whichever call it is,
+    // which a number alone does not say.
+    if matches!(n, nr::SIGNALFD4 | nr::SEMGET | nr::SEMCTL | nr::SEMTIMEDOP | nr::SEMOP)
+        || (compat && raw == crate::i386::raw::IPC)
+    {
         return None;
     }
     // A host answers the clocks and the ids before it classes a call
@@ -9819,6 +9836,7 @@ pub struct PendingCall {
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
     pub block_pc: u64,
+    pub retry_sem: bool,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -9879,6 +9897,7 @@ impl Kernel {
             retry_lock: self.retry_lock.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
+            retry_sem: std::mem::take(&mut self.retry_sem),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -9893,6 +9912,7 @@ impl Kernel {
         self.retry_lock = call.retry_lock;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
+        self.retry_sem = call.retry_sem;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -10026,6 +10046,8 @@ impl Kernel {
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
+            retry_sem: false,
+            sem_result: None,
             syscall_nr: 0,
             thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
@@ -10474,6 +10496,8 @@ impl Kernel {
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
+            retry_sem: false,
+            sem_result: None,
             syscall_nr: 0,
             thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
@@ -11140,6 +11164,25 @@ impl Kernel {
                 Some(BlockOp::AcceptWait { socket })
             }
             nr::READ | nr::READV | nr::WRITE | nr::WRITEV => self.fd_io().blocking_op(m, n, a),
+            // A semaphore operation that must wait sleeps a moment with the
+            // kernel unlocked, and `finish_blocking` makes the call again;
+            // otherwise its answer is the dispatch's.
+            nr::SEMTIMEDOP | nr::SEMOP => {
+                let who = (self.pid as usize, self.ctx_addr);
+                let timeout = if n == nr::SEMOP { 0 } else { a[3] };
+                match crate::sysv::semop(m, who, self.pid, a[0] as i32, a[1], a[2], timeout) {
+                    Ok(crate::sysv::Op::Done) => self.sem_result = Some(Ok(0)),
+                    Err(e) => self.sem_result = Some(Err(e)),
+                    // A wasm32 program's restart goes by a handler frame
+                    // (`restart_call`), which a plain wait does not have.
+                    Ok(crate::sysv::Op::Blocked) if self.wasm32 => self.sem_result = Some(Err(Errno::EAGAIN)),
+                    Ok(crate::sysv::Op::Blocked) => {
+                        self.retry_sem = true;
+                        return Some(BlockOp::Sleep(std::time::Duration::from_millis(1)));
+                    }
+                }
+                None
+            }
             // A transfer whose input is an empty blocking stream (`cat f |
             // grep x`: GNU grep splices its stdin pipe) waits for it to be
             // readable and then does the real transfer (`retry_transfer`).
@@ -11228,6 +11271,19 @@ impl Kernel {
         // handler runs, then the call again ([`restart_call`]).
         let class = std::mem::replace(&mut self.block_restart, crate::signal::Restart::Never);
         let ret_pc = std::mem::take(&mut self.block_pc).wrapping_add(gex_abi::SYSCALL_INST_BYTES);
+        // A semaphore operation that slept because it could not proceed:
+        // the call again, to try once more (a signal's EINTR ends it).
+        if std::mem::take(&mut self.retry_sem) {
+            if r.is_ok() {
+                if let Some(back) = restart_call(m, self.ctx_addr, ret_pc, false) {
+                    return SyscallOutcome::Resume(back);
+                }
+            } else {
+                // Ended by a signal: a later call is a new one, with its own
+                // timeout.
+                crate::sysv::forget((self.pid as usize, self.ctx_addr));
+            }
+        }
         if r == Err(Errno::EINTR) {
             self.collect_signals();
             self.check_timers();
@@ -11400,6 +11456,9 @@ impl Kernel {
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
+            nr::SEMGET => crate::sysv::semget(a[0] as i32, a[1] as i32, a[2]),
+            nr::SEMCTL => crate::sysv::semctl(m, a[0] as i32, a[1], a[2], a[3], self.compat),
+            nr::SEMTIMEDOP | nr::SEMOP => self.sem_result.take().unwrap_or(Err(Errno::EINVAL)),
             nr::PROCESS_VM_READV => self.sys_process_vm(m, false, a),
             nr::PROCESS_VM_WRITEV => self.sys_process_vm(m, true, a),
             // Interval timers raise their signal when due (`check_timers`,
@@ -13370,6 +13429,10 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::RT_SIGACTION => "rt_sigaction",
         nr::RT_SIGPROCMASK => "rt_sigprocmask",
         nr::SIGNALFD4 => "signalfd4",
+        nr::SEMGET => "semget",
+        nr::SEMCTL => "semctl",
+        nr::SEMTIMEDOP => "semtimedop",
+        nr::SEMOP => "semop",
         nr::RT_SIGPENDING => "rt_sigpending",
         nr::RT_SIGRETURN => "rt_sigreturn",
         nr::SIGALTSTACK => "sigaltstack",
@@ -14779,8 +14842,14 @@ mod tests {
         }
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
-        // And signalfd, which reads the process's signals (`nosys_call`).
-        assert_eq!(locked, vec![nr::SIGNALFD4, nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
+        // And signalfd, which reads the process's signals, and the System V
+        // semaphores, which wait by making the call again (`nosys_call`).
+        assert_eq!(
+            locked,
+            vec![nr::SIGNALFD4, nr::SEMGET, nr::SEMCTL, nr::SEMTIMEDOP, nr::SEMOP, nr::CLONE, nr::EXECVE, nr::CLONE3],
+            "{:?}",
+            names(&locked)
+        );
     }
 
     /// i386's `socketcall`, as Debian's i386 glibc makes every socket call,
@@ -14850,7 +14919,25 @@ mod tests {
         }
         use crate::i386::raw as x;
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes these i386 calls");
-        assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::SIGNALFD, x::SIGNALFD4, x::CLONE3], "{locked:?}");
+        // And signalfd, `ipc` (which reads its arguments from memory) and the
+        // semaphores.
+        assert_eq!(
+            locked,
+            vec![
+                x::FORK,
+                x::EXECVE,
+                x::IPC,
+                x::CLONE,
+                x::VFORK,
+                x::SIGNALFD,
+                x::SIGNALFD4,
+                x::SEMGET,
+                x::SEMCTL,
+                x::SEMTIMEDOP_TIME64,
+                x::CLONE3
+            ],
+            "{locked:?}"
+        );
     }
 
 

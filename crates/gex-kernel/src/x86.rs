@@ -356,6 +356,10 @@ pub mod raw {
     pub const EVENTFD2: u64 = 290;
     pub const SIGNALFD: u64 = 282;
     pub const SIGNALFD4: u64 = 289;
+    pub const SEMGET: u64 = 64;
+    pub const SEMOP: u64 = 65;
+    pub const SEMCTL: u64 = 66;
+    pub const SEMTIMEDOP: u64 = 220;
     pub const INOTIFY_INIT: u64 = 253;
     pub const INOTIFY_ADD_WATCH: u64 = 254;
     pub const INOTIFY_RM_WATCH: u64 = 255;
@@ -686,6 +690,10 @@ pub fn translate(
         x::ACCEPT4 => nr::ACCEPT4,
         x::EVENTFD2 => nr::EVENTFD2,
         x::SIGNALFD4 => nr::SIGNALFD4,
+        x::SEMGET => nr::SEMGET,
+        x::SEMOP => nr::SEMOP,
+        x::SEMCTL => nr::SEMCTL,
+        x::SEMTIMEDOP => nr::SEMTIMEDOP,
         x::SIGNALFD => {
             a[3] = 0;
             nr::SIGNALFD4
