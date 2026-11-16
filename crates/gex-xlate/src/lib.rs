@@ -435,7 +435,9 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .collect();
 
     // Each block's rewrite touches only that block, so they all run at once.
+    let modes = modes();
     gex_emit::par::map_mut(blocks, &|i: usize, b: &mut Block| -> usize {
+        set_modes(modes);
         let flags = pass::flags_of_mask(dead[i]);
         if flags.is_empty() {
             return 0;
@@ -602,9 +604,12 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
 
     let compat = arch::compat();
     while !frontier.is_empty() {
+        let modes = modes();
         let lifted = gex_emit::par::map(&frontier, &|&addr| {
             // The lifting threads decode in this thread's mode (an image's
-            // own, `set_thread_compat`), not only the process default.
+            // own, `set_thread_compat`), not only the process default, and
+            // know this process's default (`other_mode`).
+            set_modes(modes);
             let _mode = compat_scope(compat);
             // A recognised library function is emitted as the shim's intrinsic
             // (a `memory.copy`/`memory.fill`) instead of lifting its own code --
@@ -714,7 +719,9 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
             }
         }
         fill.sort_unstable();
+        let modes = modes();
         let lifted = gex_emit::par::map(&fill, &|&addr| {
+            set_modes(modes);
             let _mode = compat_scope(compat);
             if let Some(&k) = opts.intrinsics.get(&addr) {
                 return intrinsic::block(addr, k);
@@ -1407,7 +1414,9 @@ fn discover(
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
+        let modes = modes();
         let lifted = gex_emit::par::map(&frontier, &|&a| {
+            set_modes(modes);
             let _mode = compat_scope(compat);
             match intrinsics.get(&a) {
                 // Not lifted at all, so discovery never walks into the
@@ -1566,6 +1575,28 @@ pub fn set_thread_compat(compat: bool) {
     });
     #[cfg(not(feature = "x86"))]
     let _ = compat;
+}
+
+/// This thread's decoder modes, the process default [`set_compat`] set here
+/// and any open scope: what a thread that translates for it takes
+/// ([`set_modes`]). A native host's guest processes are threads of one host
+/// process, so each has its own default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Modes(#[cfg(feature = "x86")] (u8, u8));
+
+pub fn modes() -> Modes {
+    Modes(
+        #[cfg(feature = "x86")]
+        gex_isa_x86::capture_modes(),
+    )
+}
+
+/// Take the modes [`modes`] gave, on this thread.
+pub fn set_modes(m: Modes) {
+    #[cfg(feature = "x86")]
+    gex_isa_x86::restore_modes(m.0);
+    #[cfg(not(feature = "x86"))]
+    let _ = m;
 }
 
 /// [`set_thread_compat`] for as long as the scope lives; dropping it restores

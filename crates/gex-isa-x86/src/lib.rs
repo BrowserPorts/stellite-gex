@@ -47,6 +47,12 @@ std::thread_local! {
     /// This thread's mode while a [`ModeScope`] is open: 0 none (the
     /// process default holds), else `1 + Mode as u8`.
     static SCOPED: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+    /// This thread's process default, as [`set_mode`] last set it here: 0
+    /// none (then `MODE`'s), else `1 + Mode as u8`. A native host runs every
+    /// guest process as threads of one host process, so an i386 child of an
+    /// x86-64 shell setting the one global default made the shell decode its
+    /// own code as 32-bit, and the child the shell's way.
+    static DEFAULT: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
 /// Set the process default every following `decode` uses: a whole i386
@@ -55,7 +61,21 @@ std::thread_local! {
 /// [`ModeScope`] instead. Clears this thread's own mode.
 pub fn set_mode(m: Mode) {
     MODE.store(m as u8, core::sync::atomic::Ordering::Relaxed);
+    DEFAULT.with(|d| d.set(1 + m as u8));
     SCOPED.with(|s| s.set(0));
+}
+
+/// This thread's modes, the process default and any scoped one, for a
+/// thread that works for it (a translation's helpers, the same process's
+/// next thread): [`restore_modes`] on the other side.
+pub fn capture_modes() -> (u8, u8) {
+    (DEFAULT.with(|d| d.get()), SCOPED.with(|s| s.get()))
+}
+
+/// Give this thread the modes [`capture_modes`] took.
+pub fn restore_modes((default, scoped): (u8, u8)) {
+    DEFAULT.with(|d| d.set(default));
+    SCOPED.with(|s| s.set(scoped));
 }
 
 /// Set this thread's mode until the next call (or `set_mode` on this thread),
@@ -69,7 +89,7 @@ pub fn set_thread_mode(m: Mode) {
 /// process default.
 pub fn mode() -> Mode {
     let v = match SCOPED.with(|s| s.get()) {
-        0 => MODE.load(core::sync::atomic::Ordering::Relaxed),
+        0 => default_mode() as u8,
         v => v - 1,
     };
     if v == 0 {
@@ -81,7 +101,11 @@ pub fn mode() -> Mode {
 
 /// The process default, whatever scope this thread has open.
 pub fn default_mode() -> Mode {
-    if MODE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+    let m = match DEFAULT.with(|d| d.get()) {
+        0 => MODE.load(core::sync::atomic::Ordering::Relaxed),
+        v => v - 1,
+    };
+    if m == 0 {
         Mode::Long
     } else {
         Mode::Compat

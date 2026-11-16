@@ -450,12 +450,23 @@ pub fn take_retire_why() -> Vec<RetireWhy> {
 /// 32 bits. Every host write of a GPR goes through [`gpr`].
 static COMPAT32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+std::thread_local! {
+    /// This thread's answer, 0 none yet (then `COMPAT32`'s), 1 no, 2 yes:
+    /// per thread, as the decoder's mode is, because a native host's guest
+    /// processes are threads of one host process.
+    static THREAD_COMPAT32: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 pub fn set_compat32(on: bool) {
     COMPAT32.store(on, std::sync::atomic::Ordering::Relaxed);
+    THREAD_COMPAT32.with(|t| t.set(if on { 2 } else { 1 }));
 }
 
 pub fn compat32() -> bool {
-    COMPAT32.load(std::sync::atomic::Ordering::Relaxed)
+    match THREAD_COMPAT32.with(|t| t.get()) {
+        0 => COMPAT32.load(std::sync::atomic::Ordering::Relaxed),
+        v => v == 2,
+    }
 }
 
 /// A GPR value as the host writes it into the context: zero-extended from 32

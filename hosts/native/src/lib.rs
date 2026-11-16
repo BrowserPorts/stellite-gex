@@ -385,6 +385,31 @@ struct SpawnContext {
     /// next thread's (`libprov::stack`): a process that starts and ends
     /// threads all its life uses no more of them than it ever ran at once.
     provider_stacks: Mutex<Vec<u64>>,
+    /// The process's decoder modes and 32-bit flag, which a native host
+    /// keeps per host thread: each of its threads starts with them.
+    modes: ProcessModes,
+}
+
+/// What a guest process's host threads decode and speak: per host thread,
+/// because every guest process is threads of this one host process, and an
+/// i386 child of an x86-64 shell must not turn the shell 32-bit.
+#[derive(Clone, Copy, Debug)]
+struct ProcessModes {
+    decode: gex_xlate::Modes,
+    compat32: bool,
+}
+
+impl ProcessModes {
+    /// This thread's.
+    fn here() -> ProcessModes {
+        ProcessModes { decode: gex_xlate::modes(), compat32: gex_kernel::compat32() }
+    }
+
+    /// Make them this thread's.
+    fn apply(self) {
+        gex_xlate::set_modes(self.decode);
+        gex_kernel::set_compat32(self.compat32);
+    }
 }
 
 /// Tier-1 counters for `GEX_WIN_STATS`: translations published, units
@@ -1518,6 +1543,7 @@ fn run_program_with(
         prof_proc: prof_proc.clone(),
         fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
         provider_stacks: Mutex::new(Vec::new()),
+        modes: ProcessModes::here(),
     });
     note_live_process(&spawn);
     store.data_mut().spawn = Some(Arc::clone(&spawn));
@@ -2522,6 +2548,7 @@ fn run_thread_loop(
 
 /// A guest thread's whole host life, once it has a host thread.
 fn guest_thread_body(cx: Arc<SpawnContext>, child: ThreadState) {
+    cx.modes.apply();
     let running = Arc::clone(&cx.running);
     match run_guest_thread(Arc::clone(&cx), child) {
         Err(e) => {
@@ -2899,6 +2926,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
         // the parent's free ones are mapped in the child's copy too
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        modes: cx.modes,
     });
     note_live_process(&child_cx);
     let status = {
@@ -2917,6 +2945,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
         .spawn(move || {
+            // A forked child runs its parent's image, in its parent's modes.
+            child_cx.modes.apply();
             // Weak: a child that execs drops this context, and its memory
             // (the parent's copy) with it, while the new program runs.
             let cleanup = Arc::downgrade(&child_cx);
