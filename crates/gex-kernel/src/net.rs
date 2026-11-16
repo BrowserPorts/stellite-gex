@@ -2090,7 +2090,8 @@ impl FileHandle for Socket {
             // A connection that has failed or finished is readable: the
             // answer is an error or an end, and either way it is ready.
             Some(t) => t.has_data() || matches!(t.status(), Status::Closed | Status::Refused),
-            None => true,
+            // No `connect` yet: not ready (see `poll_writable`).
+            None => false,
         }
     }
 
@@ -2122,9 +2123,15 @@ impl FileHandle for Socket {
         }
         match &*self.transport.lock().unwrap() {
             Some(t) => !matches!(t.status(), Status::Connecting),
-            // No `connect` yet. A fresh TCP socket is writable on Linux too,
-            // and a caller polling one has not asked about a connection.
-            None => true,
+            // No `connect` yet. Linux reports a fresh TCP socket as
+            // EPOLLOUT|EPOLLHUP, but a program that watches one does so to
+            // hear about the connect it is about to start, and on Linux the
+            // connect is under way before a waiter wakes to look. Here the
+            // connect is slower (a lookup, then the host's connect), so the
+            // waiter always won: Steam's completion port took its one-shot
+            // event for the socket before the connect began, and never heard
+            // from it again. Nothing has happened to it, so nothing is ready.
+            None => false,
         }
     }
 }
@@ -2284,6 +2291,49 @@ mod tests {
         assert_eq!(&b[..2], b"hi");
         c.shutdown(1).unwrap();
         assert_eq!(s.status(), Status::Closed, "and its shutdown reaches the far end");
+    }
+
+    /// A network whose connections are made before `connect` returns, as
+    /// the native host's are.
+    #[derive(Debug)]
+    struct AtOnce;
+    #[derive(Debug)]
+    struct Open;
+    impl Transport for Open {
+        fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
+            Ok(())
+        }
+        fn status(&self) -> Status {
+            Status::Open
+        }
+        fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+            Ok(data.len())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
+            Err(Errno::EAGAIN)
+        }
+        fn has_data(&self) -> bool {
+            false
+        }
+        fn close(&self) {}
+    }
+    impl NetStack for AtOnce {
+        fn tcp(&self) -> Result<Arc<dyn Transport>, Errno> {
+            Ok(Arc::new(Open))
+        }
+    }
+
+    /// Steam's completion port: a fresh socket is not ready until a connect
+    /// has begun. A non-blocking connect says EINPROGRESS, even when the
+    /// host's was done before it returned; the next says how it went.
+    #[test]
+    fn a_fresh_socket_waits_for_its_connect() {
+        let (net, res, ports) = (Arc::new(AtOnce) as Arc<dyn NetStack>, Arc::new(Resolver::new()), Arc::new(Ports::new()));
+        let s = Socket::new(Kind::Tcp, net, res, ports, None);
+        assert!(!s.poll_writable() && !s.poll_readable(), "nothing has happened to it");
+        assert_eq!(s.connect(0x5db8_d822, 443), Err(Errno::EINPROGRESS));
+        assert!(s.poll_writable(), "connected: EPOLLOUT");
+        assert_eq!(s.connect(0x5db8_d822, 443), Ok(()), "and a second connect says it is connected");
     }
 
     #[test]
