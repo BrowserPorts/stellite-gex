@@ -630,7 +630,8 @@ impl FileSystem for ProcFs {
         }
         if let Some((e, rest)) = self.other(&path) {
             return match rest.as_str() {
-                "" | "task" => Ok(Metadata::dir()),
+                "" => Ok(Metadata::dir()),
+                "task" => Ok(task_dir(e.tasks().len())),
                 r if self.generate_other(&e, r, tid).is_some() => Ok(Metadata {
                     file_type: FileType::Regular,
                     size: 0,
@@ -645,7 +646,8 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "self/task" => Ok(task_dir(self.tasks_of("self").len())),
+            "" | "self" | "self/fd" | "self/fdinfo" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
@@ -675,6 +677,15 @@ impl FileSystem for ProcFs {
             }
         }
     }
+}
+
+/// A `task` directory with `threads` threads listed: its links are `.`, `..`
+/// and one per thread, as Linux counts them. Chromium's sandbox counts a
+/// process's threads this way (`ThreadHelpers`), and its zygote CHECKs for
+/// at least three: with a plain directory's two it died at start, and the
+/// Steam client's webhelper had no renderers.
+fn task_dir(threads: usize) -> Metadata {
+    Metadata { nlink: 2 + threads.max(1) as u32, ..Metadata::dir() }
 }
 
 fn base_entries() -> Vec<DirEntry> {
@@ -865,6 +876,18 @@ mod tests {
         let t = read(&f, "7/task/9/stat");
         assert_eq!((field(&t, 1), field(&t, 13)), ("(xterm)".into(), "150".into()));
         assert_eq!(read(&f, "7/task/9/comm"), "xterm\n");
+    }
+
+    /// A `task` directory counts `.`, `..` and each thread it lists, as
+    /// Chromium's single-thread check (`st_nlink >= 3`) needs.
+    #[test]
+    fn a_task_directory_links_its_threads() {
+        let f = fs();
+        let md = f.metadata("self/task").unwrap();
+        assert_eq!(md.file_type, FileType::Directory);
+        let listed = f.open("self/task", 0, 0).unwrap().read_dir().unwrap().len();
+        assert!(md.nlink >= 3, "{}", md.nlink);
+        assert_eq!(md.nlink as usize, listed, "the links it says it has are the entries it lists");
     }
 
     fn fs() -> ProcFs {
