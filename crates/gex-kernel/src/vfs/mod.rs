@@ -1390,10 +1390,20 @@ impl Namespace {
                 prefix.push('/');
                 prefix.push_str(c);
                 let (at, fs) = self.mount_at(&prefix)?;
-                if at != "/" {
+                // /proc, /dev and /sys name their own links (`self`,
+                // `fd/N`); any other mount -- a host directory bound in --
+                // holds links like the root's. A program's own absolute
+                // links there (Steam's `~/.steam/steam`) name guest paths,
+                // and a create beneath one went to the host, which has no
+                // such path.
+                if ["/proc", "/dev", "/sys"].iter().any(|own| at == *own || within(at, own)) {
                     break;
                 }
-                if let Ok(target) = fs.read_link(prefix.trim_start_matches('/')) {
+                let rel = if at == "/" { prefix.trim_start_matches('/') } else { prefix[at.len()..].trim_start_matches('/') };
+                if rel.is_empty() {
+                    continue;
+                }
+                if let Ok(target) = fs.read_link(rel) {
                     let base = if target.starts_with('/') {
                         normalize(&target, "/")
                     } else {
@@ -2073,6 +2083,25 @@ mod tests {
         assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
         assert!(vfs.metadata("/bin/sh").is_ok());
         assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
+    }
+
+    #[test]
+    fn a_bound_directorys_absolute_links_name_guest_paths() {
+        // Steam's `~/.steam/steam` -> its install, in a home bound in from
+        // elsewhere: the link names a guest path, not one inside the mount.
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("data/steam/keep", b"".to_vec());
+        vfs.mount("/", root);
+        let home = Arc::new(TmpFs::new());
+        home.add_file(".steam/keep", b"".to_vec());
+        vfs.mount("/home/p", home);
+        vfs.symlink("/data/steam", "/home/p/.steam/steam").unwrap();
+        assert_eq!(vfs.resolve("/home/p/.steam/steam/config.vdf").unwrap().1, "data/steam/config.vdf");
+        assert!(vfs.metadata("/home/p/.steam/steam/keep").is_ok());
+        // /proc's own links stay its own.
+        vfs.mount("/proc", Arc::new(TmpFs::new()));
+        assert_eq!(vfs.resolve("/proc/self/maps").unwrap().1, "self/maps");
     }
 
     #[test]
