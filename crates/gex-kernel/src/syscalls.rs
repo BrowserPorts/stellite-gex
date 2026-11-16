@@ -32,6 +32,8 @@ pub mod nr {
     pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
+    /// `mknodat` (`PathIo::sys_mknodat`): FIFOs and empty files.
+    pub const MKNODAT: u64 = 33;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
     pub const SYMLINKAT: u64 = 36;
@@ -3405,6 +3407,7 @@ impl PathIo<'_> {
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::MKNODAT => self.sys_mknodat(m, a[0] as i32, a[1], a[2] as u32),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             // There is one process's view of the world and nothing consults
@@ -3532,6 +3535,15 @@ impl PathIo<'_> {
         // different Workers. Intercepted before the VFS, which has no such nodes.
         if let Some(res) = self.open_pty(&p, flags) {
             return res;
+        }
+        // A FIFO opens as an end of its pipe ([`crate::fifo`]).
+        if crate::fifo::is_fifo(&p) {
+            let acc = flags & 0o3;
+            let (read, write) = (acc != oflags::O_WRONLY, acc != oflags::O_RDONLY);
+            if let Some(r) = crate::fifo::open(&p, read, write, flags & oflags::O_NONBLOCK != 0) {
+                let file = OpenFile::new(r?, p.clone(), flags, read, write);
+                return self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0);
+            }
         }
         // `/proc/self/fd/N` (and `/dev/stdin`, `/dev/fd/N`, which lead there)
         // names the descriptor's file itself, as Linux's magic link does,
@@ -3754,6 +3766,7 @@ impl PathIo<'_> {
             } else {
                 self.ns.metadata(&p)?
             };
+            let md = if crate::fifo::is_fifo(&p) { crate::fifo::metadata(md) } else { md };
             (md, self.ns.mount_id_of(&p))
         };
         let st = Kernel::stat_from(&md);
@@ -3852,6 +3865,7 @@ impl PathIo<'_> {
         };
         crate::phase::mark(7);
         let md = md?;
+        let md = if crate::fifo::is_fifo(&p) { crate::fifo::metadata(md) } else { md };
         m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
         crate::phase::mark(9);
         Ok(0)
@@ -3998,6 +4012,27 @@ impl PathIo<'_> {
         self.ns.link(&from, &to).map(|_| 0)
     }
 
+    /// `mknodat`: a FIFO ([`crate::fifo`]), or an empty regular file. A
+    /// device node is `EPERM`, as for anyone but root, and so is a socket
+    /// node, which only `bind` makes here. Steam's runtime logger makes a
+    /// FIFO for each program's output, and fell back to a pipe without one.
+    pub fn sys_mknodat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        const S_IFMT: u32 = 0o170000;
+        const S_IFIFO: u32 = 0o010000;
+        const S_IFREG: u32 = 0o100000;
+        let kind = mode & S_IFMT;
+        if kind != 0 && kind != S_IFIFO && kind != S_IFREG {
+            return Err(Errno::EPERM);
+        }
+        let p = self.at_path(m, dirfd, path)?;
+        let perm = mode & 0o7777 & !self.fs.umask();
+        drop(self.ns.open(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm)?);
+        if kind == S_IFIFO {
+            crate::fifo::make(&p);
+        }
+        Ok(0)
+    }
+
     pub fn sys_mkdirat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         // "link/" where link dangles: the name is taken (EEXIST); resolving
         // the slash would say ENOENT
@@ -4030,6 +4065,7 @@ impl PathIo<'_> {
         } else {
             let sock = self.is_socket_file(&p);
             self.ns.unlink(&p)?;
+            crate::fifo::forget(&p);
             if sock {
                 self.socket_renamed(&p, None);
             }
@@ -4120,6 +4156,7 @@ impl PathIo<'_> {
         let from_moves = self.ns.metadata_nofollow(&from).is_ok_and(|md| matches!(md.file_type, FileType::Socket | FileType::Directory));
         let to_sock = self.is_socket_file(&to);
         self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0)?;
+        crate::fifo::rename(&from, &to);
         if from_moves && from != to {
             self.socket_renamed(&from, Some(&to));
         } else if to_sock && from != to {
@@ -5953,6 +5990,7 @@ fn is_path(n: u64) -> bool {
             | nr::READLINKAT
             | nr::GETCWD
             | nr::MKDIRAT
+            | nr::MKNODAT
             | nr::UNLINKAT
             | nr::RENAMEAT
             | nr::RENAMEAT2
@@ -7420,6 +7458,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
@@ -7525,6 +7564,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
@@ -9029,6 +9069,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FACCESSAT2
         | nr::UNLINKAT
         | nr::MKDIRAT
+        | nr::MKNODAT
         | nr::READLINKAT
         | nr::UTIMENSAT
         | nr::FCHOWNAT
@@ -13338,6 +13379,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FCNTL => "fcntl",
         nr::IOCTL => "ioctl",
         nr::MKDIRAT => "mkdirat",
+        nr::MKNODAT => "mknodat",
         nr::UNLINKAT => "unlinkat",
         nr::LINKAT => "linkat",
         nr::SYMLINKAT => "symlinkat",

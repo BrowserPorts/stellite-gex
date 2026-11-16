@@ -212,6 +212,8 @@ pub mod raw {
     pub const TGKILL: u64 = 270;
     pub const OPENAT: u64 = 295;
     pub const MKDIRAT: u64 = 296;
+    pub const MKNOD: u64 = 14;
+    pub const MKNODAT: u64 = 297;
     pub const FCHOWNAT: u64 = 298;
     pub const FSTATAT64: u64 = 300;
     pub const UNLINKAT: u64 = 301;
@@ -688,6 +690,14 @@ pub fn translate(
         x::MKDIRAT => {
             a[0] = sext(a[0]);
             nr::MKDIRAT
+        }
+        x::MKNOD => {
+            *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
+            nr::MKNODAT
+        }
+        x::MKNODAT => {
+            a[0] = sext(a[0]);
+            nr::MKNODAT
         }
         x::UNLINKAT => {
             a[0] = sext(a[0]);

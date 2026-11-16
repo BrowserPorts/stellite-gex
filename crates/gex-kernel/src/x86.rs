@@ -318,6 +318,8 @@ pub mod raw {
     pub const TGKILL: u64 = 234;
     pub const OPENAT: u64 = 257;
     pub const MKDIRAT: u64 = 258;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
     pub const FCHOWNAT: u64 = 260;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
@@ -662,6 +664,11 @@ pub fn translate(
         x::TGKILL => nr::TGKILL,
         x::OPENAT => nr::OPENAT,
         x::MKDIRAT => nr::MKDIRAT,
+        x::MKNOD => {
+            *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
+            nr::MKNODAT
+        }
+        x::MKNODAT => nr::MKNODAT,
         x::FCHOWNAT => nr::FCHOWNAT,
         x::NEWFSTATAT => nr::NEWFSTATAT,
         x::UNLINKAT => nr::UNLINKAT,
