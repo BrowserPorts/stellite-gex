@@ -2071,6 +2071,17 @@ fn perform_block(
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
+                // An epoll set whose interest list changed since its
+                // descriptors were collected (a descriptor added, or its
+                // events changed): what is in hand may never become ready.
+                // Wake with no events, as the page does, and the caller's
+                // loop makes the call again, which collects them afresh.
+                // Steam's completion ports parked on an empty list for ever.
+                if let gex_kernel::syscalls::PollReport::Epoll { set, generation, .. } = &report {
+                    if set.generation() != *generation {
+                        return Ok(0);
+                    }
+                }
                 turn!(poll, seen);
             }
         }
