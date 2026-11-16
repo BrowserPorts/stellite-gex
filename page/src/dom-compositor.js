@@ -43,6 +43,7 @@
 // the guest's GL. Such a window gets a WebGPU canvas of its own, laid over its
 // 2D one, and the renderer presents into it -- see `#drawGl` below.
 
+import { attachDwmIcon } from './dwm-frame.js';
 import {
   readScene,
   sceneMarks,
@@ -128,6 +129,11 @@ class DomWindow {
      * `showGlCanvas`. */
     this.glCanvas = null;
     this.glFrame = 0;
+    /** Its glass (`gex_glass_v1`), as `readScene` gives it, or null; and
+     * `onglass`, told when that changes (dom-glass.js). */
+    this.glass = s.glass || null;
+    this.glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    this.onglass = null;
     this.canvas = document.createElement('canvas');
     this.canvas.width = Math.max(1, s.width);
     this.canvas.height = Math.max(1, s.height);
@@ -209,6 +215,11 @@ class DomWindow {
   /** Give this window the keyboard. */
   focus() {
     this.#desktop.focus(this);
+  }
+
+  /** Whether this window has the keyboard. */
+  get focused() {
+    return this.#desktop.focused() === this;
   }
 
   /** Give this window a WebGPU canvas of its own for surface `uid`, which the
@@ -308,16 +319,42 @@ class DomWindow {
     }
     const out = this.#image.data;
     const stride = s.stride;
+    // DWM's rule: with glass, an opaque window's (XRGB: GDI's, which leaves
+    // the alpha byte 0) alpha counts in its glass and nowhere else. A window
+    // with alpha of its own (ARGB: per-pixel layered) keeps it everywhere.
+    // As compositor-worker.js's shader.
+    const glass = s.format === 1 && this.glass?.rects?.length ? this.glass.rects : null;
+    // And with a frame DWM draws, the frame goes over the window outside
+    // its client area: the window's own pixels there do not show.
+    const c = this.glass?.frame & 1 && this.glass.client?.w > 0 ? this.glass.client : null;
     let o = 0;
     for (let row = 0; row < h; row++) {
       let i = s.addr + (y + row) * stride + x * 4;
+      const yy = y + row;
+      const spans = glass?.filter((r) => yy >= r.y && yy < r.y + r.h);
       for (let col = 0; col < w; col++, i += 4, o += 4) {
         // shm is ARGB8888 little-endian -- B, G, R, A in memory -- and
         // `ImageData` is R, G, B, A. One swizzle, over the damage only.
         out[o] = mem[i + 2];
         out[o + 1] = mem[i + 1];
         out[o + 2] = mem[i];
-        out[o + 3] = s.format === 1 ? 255 : mem[i + 3];
+        const xx = x + col;
+        let a;
+        if (c && (xx < c.x || xx >= c.x + c.w || yy < c.y || yy >= c.y + c.h)) {
+          a = 0;
+        } else if (glass) {
+          a = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
+        } else {
+          a = s.format === 1 ? 255 : mem[i + 3];
+        }
+        out[o + 3] = a;
+        // The pixels are premultiplied (wl_shm's ARGB8888; and DWM blends a
+        // window's pixels so): ImageData wants them straight.
+        if (a < 255 && a > 0) {
+          out[o] = Math.min(255, Math.round((out[o] * 255) / a));
+          out[o + 1] = Math.min(255, Math.round((out[o + 1] * 255) / a));
+          out[o + 2] = Math.min(255, Math.round((out[o + 2] * 255) / a));
+        }
       }
     }
     ctx.putImageData(this.#image, x, y);
@@ -817,6 +854,17 @@ export class DomDesktop {
     if (s.placed && s.activate !== win.activate) {
       win.activate = s.activate;
       this.focus(win);
+    }
+    // Glass changed: the page moves its panes and frame, and the whole window
+    // is copied again, since which of its pixels are see-through changed.
+    // the caption's icon, where its pixels are (dwm-frame.js)
+    attachDwmIcon(s.glass, this.#pixelsOf(s));
+    const glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    if (glassSig !== win.glassSig) {
+      win.glassSig = glassSig;
+      win.glass = s.glass || null;
+      win.serial = -1;
+      win.onglass?.(win.glass);
     }
     // Nothing to copy when there is no buffer: a window whose pixels are the
     // host's GL has none, and neither has one the window manager published
