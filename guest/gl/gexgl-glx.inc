@@ -138,10 +138,19 @@ const char *glXQueryExtensionsString(void *dpy, int screen) {
            "GLX_SGI_make_current_read";
 }
 
-const char *glXGetClientString(void *dpy, int name) { (void)dpy; (void)name; return "gex"; }
+/* By name: GLX_VERSION must parse as "major.minor" (libepoxy asserts it,
+   and Chromium's GTK aborts in that assert), and GLX_EXTENSIONS is the list
+   above. */
+static const char *gexgl_glx_string(void *dpy, int screen, int name) {
+    switch (name) {
+    case 2 /* GLX_VERSION */: return "1.4";
+    case 3 /* GLX_EXTENSIONS */: return glXQueryExtensionsString(dpy, screen);
+    default /* GLX_VENDOR */: return "gex";
+    }
+}
+const char *glXGetClientString(void *dpy, int name) { return gexgl_glx_string(dpy, 0, name); }
 const char *glXQueryServerString(void *dpy, int screen, int name) {
-    (void)dpy; (void)screen; (void)name;
-    return "gex";
+    return gexgl_glx_string(dpy, screen, name);
 }
 
 /* The attribute lists are read only far enough to refuse what cannot be

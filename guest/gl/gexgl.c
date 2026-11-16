@@ -4178,7 +4178,11 @@ struct gexgl_egl_surface {
        `gexgl_x11_follow_size`), and the top-level window its frames are
        attached to. */
     unsigned x_swaps;
+    long long x_asked_ms;
     unsigned long x_top;
+    /* X only: the window was not viewable when last asked, so its frames are
+       not presented (see `gexgl_x11_viewable`). */
+    int x_hidden;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
@@ -4655,6 +4659,44 @@ static int gexgl_x11_error(void *display, void *event) {
     return 0;
 }
 
+/* Whether an X window is on screen: mapped, with every ancestor mapped.
+ *
+ * The WebGPU host has one canvas, and the surface that presented last owns
+ * it. Steam's 2019 client keeps a 32x32 window it never maps, draws into it
+ * and swaps it beside its login window, so the canvas went back to 32x32
+ * every frame and the login window showed nothing. A window nobody can see
+ * has nothing to present. Unknown (no Xlib, or the request failed) counts as
+ * viewable, so nothing that worked before stops presenting. */
+struct gexgl_x_window_attributes {
+    int x, y, width, height, border_width, depth;
+    void *visual;
+    unsigned long root;
+    int class_, bit_gravity, win_gravity, backing_store;
+    unsigned long backing_planes, backing_pixel;
+    int save_under;
+    unsigned long colormap;
+    int map_installed, map_state;
+    long all_event_masks, your_event_mask, do_not_propagate_mask;
+    int override_redirect;
+    void *screen;
+};
+
+static int gexgl_x11_viewable(void *win) {
+    void *display = gexgl_x11_client_display();
+    void *xlib = gexgl_x11_symbol_source();
+    if (!display || !xlib || !win) return 1;
+    int (*get_attributes)(void *, unsigned long, struct gexgl_x_window_attributes *) =
+        dlsym(xlib, "XGetWindowAttributes");
+    void *(*set_error_handler)(void *) = dlsym(xlib, "XSetErrorHandler");
+    if (!get_attributes || !set_error_handler) return 1;
+    void *previous = set_error_handler((void *)gexgl_x11_error);
+    struct gexgl_x_window_attributes a;
+    memset(&a, 0, sizeof a);
+    const int ok = get_attributes(display, (unsigned long)(uintptr_t)win, &a);
+    set_error_handler(previous);
+    return !ok || a.map_state == 2; /* IsViewable */
+}
+
 static int gexgl_x11_window_size(void *win, int *width, int *height) {
     /* The caller's connection, and only the caller's: XCreateWindow is
        asynchronous, and an application creates its window and asks for a
@@ -4828,12 +4870,30 @@ static void gexgl_wl_follow_size(struct gexgl_egl_surface *s) {
 /* An X window's resize, followed at swap time as a real GLX driver does: SDL
  * makes Unity's window at the desktop's size and resizes it after the context
  * exists, and without this the host kept drawing at the first size. Asking
- * the server costs a round trip, so it is asked on the first swaps and then
- * every 30th. */
+ * the server costs a round trip, so it is asked on the first swaps, then every
+ * 30th, and otherwise when a fifth of a second has passed since the last ask.
+ * The time is for a client that swaps only when it redraws: Steam's VGUI
+ * makes its window 32x32, swaps a few times and grows it, and with a count
+ * alone its drawable stayed 32x32 until the 30th swap, which an idle login
+ * window never reached. Every copy out of the window then failed, and the
+ * window stayed blank. */
+static long long gexgl_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
 static void gexgl_x11_follow_size(struct gexgl_egl_surface *s) {
     if (!s || s->kind != GEXGL_SURFACE_X) return;
     unsigned n = s->x_swaps++;
-    if (n > 8 && n % 30 != 0) return;
+    const long long now = gexgl_now_ms();
+    /* A window last seen hidden is asked again at every swap: a toolkit
+       that unmaps and remaps its window to change panels (Steam's VGUI)
+       repaints once and then idles, and that one frame, skipped on a stale
+       answer, was the last the screen ever got. */
+    if (!s->x_hidden && n > 8 && n % 30 != 0 && now - s->x_asked_ms < 200) return;
+    s->x_asked_ms = now;
+    s->x_hidden = !gexgl_x11_viewable(s->native);
     /* Reparented since it was attached: SDL 1.2 going fullscreen moves its
        GL window into an override-redirect window of the screen's size, which
        is then the window on top. The frames follow it. */
@@ -5176,6 +5236,13 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     CMD0(GEXGL_PRESENT);
     gexgl_wl_follow_size(s);
     gexgl_x11_follow_size(s);
+    /* Not on screen: the drawing so far goes to the host, but no frame is
+       presented, so it cannot take the canvas from a window that is. Not a
+       swap the pacing below counts, either. */
+    if (s && s->kind == GEXGL_SURFACE_X && s->x_hidden) {
+        flush_async();
+        return EGL_TRUE;
+    }
     const int interval = swap_interval_now();
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */
