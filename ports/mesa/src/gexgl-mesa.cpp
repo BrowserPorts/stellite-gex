@@ -3362,4 +3362,20 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_surface_canvas(uint32_t uid, uint32_t on) {
     set_window_canvas(uid, on != 0);
 }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_produced() { return produced; }
+/* The frames a client's D3D windows have presented that the page has not
+ * shown yet: what the page paces that client's presents by
+ * (page/src/d3d-pacing.js). Its windows are in the globals while it is the
+ * current client, in its saved state otherwise. */
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_client_unshown(uint32_t client) {
+    const std::map<uint32_t, gex_surface>* table = &surfaces;
+    if (client != current_client) {
+        auto c = clients.find(client);
+        if (c == clients.end()) return 0;
+        table = &c->second.surfaces;
+    }
+    uint32_t n = 0;
+    for (const auto& entry : *table)
+        if (entry.second.external) n += entry.second.produced - entry.second.displayed;
+    return n;
+}
 }

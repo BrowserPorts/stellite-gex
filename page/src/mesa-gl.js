@@ -16,6 +16,7 @@ import { assetFiles, assetUrl, pageParams } from './page-env.js';
 import { logOn } from '@gex/log.mjs';
 import { ValidationLog } from './gl-validation.js';
 import { fitReply } from './gl-reply.js';
+import { D3dPacer, d3dSwapInterval } from './d3d-pacing.js';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -270,6 +271,8 @@ export class MesaGlDevice {
   #submit = null;
   /** The D3D device's submit, when the module has one. */
   #d3dSubmit = null;
+  /** Its presents' pacing (d3d-pacing.js), when it has one. */
+  #d3dPacer = null;
   #failed = null;
   /** WebGPU validation errors: counted, the first kept, rate-limited logs. */
   #validation = new ValidationLog();
@@ -385,6 +388,14 @@ export class MesaGlDevice {
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
       if (out.#module.gexD3dSubmitRaw)
         out.#d3dSubmit = WebAssembly.promising(out.#module.gexD3dSubmitRaw);
+      // A module from before the count it is paced by has no pacing.
+      if (out.#d3dSubmit && out.#module._gex_gl_client_unshown) {
+        const m = out.#module;
+        out.#d3dPacer = new D3dPacer({
+          interval: d3dSwapInterval(options.env),
+          unshown: (client) => m._gex_gl_client_unshown(client >>> 0),
+        });
+      }
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
       // Environment for Mesa (`?mesaenv=`), before the context exists.
@@ -660,6 +671,14 @@ export class MesaGlDevice {
       }
       throw e;
     };
+    // A D3D client's reply waits while it is too far ahead of what the page
+    // has shown (d3d-pacing.js). After `done`, so the module is free to show
+    // frames meanwhile.
+    const paced = (rc) => {
+      const out = done(rc);
+      const hold = d3d ? this.#d3dPacer?.after(client >>> 0) : null;
+      return hold ? hold.then(() => out) : out;
+    };
     let result;
     try {
       result = (d3d ? this.#d3dSubmit : this.#submit)(ptr, tail, client >>> 0);
@@ -667,8 +686,8 @@ export class MesaGlDevice {
       return report(e);
     }
     return result instanceof Promise
-      ? result.then(done, report)
-      : done(result);
+      ? result.then(paced, report)
+      : paced(result);
   }
 
   /** What the guest says its frames belong to: see `op::SURFACE_ATTACH`.
@@ -798,7 +817,10 @@ export class MesaGlDevice {
       this.#displayLater = true;
       return 0;
     }
-    return this.#module?._gex_gl_display?.() ?? 0;
+    const shown = this.#module?._gex_gl_display?.() ?? 0;
+    // D3D clients held for the page to show their frames (d3d-pacing.js).
+    this.#d3dPacer?.shown();
+    return shown;
   }
 
   // The rest of the renderer interface a directGl demo uses. This device
