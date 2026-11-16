@@ -969,6 +969,9 @@ async function begin(opts, base, at, state, meter, lets) {
     identities: b.identities ?? null,
     stateful: b.stateful ?? null,
     providerSources: b.providerSources ?? null,
+    // A Wine build run through something else (a launch script): the build's
+    // own loader is the Wine whose game controllers the run starts.
+    wine: exe !== b.exe ? b.exe : null,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
     onFilesLoaded: () => {
