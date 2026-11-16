@@ -545,13 +545,10 @@ export class MesaGlDevice {
     this.#submits++;
     this.#bytes += tail;
     const src = new Uint8Array(memory.buffer, ring + HEADER_BYTES, tail);
-    if (!d3d && this.capture && !this.capture.record(src, replyCap) && !this.capture.posted) {
-      // Full: hand the recording to whoever serves the page (a Worker has
-      // no CDP-reachable global the page's driver can read).
-      this.capture.posted = true;
-      const bytes = this.capture.toBytes();
-      this.capture = null;
-      fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
+    if (!d3d && this.capture) {
+      this.capture.from(client);
+      // Full: hand the recording to whoever serves the page.
+      if (!this.capture.record(src, replyCap)) this.postCapture();
     }
 
     const timed = d3d && this.statsOn;
@@ -752,6 +749,19 @@ export class MesaGlDevice {
     m._gex_gl_surface_canvas(frame >>> 0, on ? 1 : 0);
   }
 
+  /** Hand the recording (`?glcapture=1`) to whoever serves the page, a
+   *  Worker having no CDP-reachable global the page's driver can read: once,
+   *  and nothing more is recorded. When it fills, and when the last process
+   *  it recorded exits (`forgetClient`), so that a run that ends before the
+   *  ceiling saves what it recorded. */
+  postCapture() {
+    const capture = this.capture;
+    if (!capture || capture.posted || !capture.batches) return;
+    capture.posted = true;
+    this.capture = null;
+    fetch('/__gex_capture', { method: 'POST', body: capture.toBytes() }).catch(() => {});
+  }
+
   /** That process is gone: release its context, its windows and their frames.
    *
    * A client that exits says nothing -- it is not there to say it -- so the
@@ -759,6 +769,7 @@ export class MesaGlDevice {
    * compositor drawing the last picture of a window that has closed. */
   forgetClient(client) {
     const m = this.#module;
+    if (this.capture?.gone(client)) this.postCapture();
     if (!m?._gex_gl_forget_client || !client) return;
     // Not while a submit is suspended, for the reason `display` gives: it
     // would re-enter the module on this thread while the submit holds its
