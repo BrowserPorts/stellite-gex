@@ -602,7 +602,7 @@ fn arena_full(lo: u64, hi: u64, len: u64) {
 /// Whether `[start, end)` touches guest memory the runtime owns but no VMA
 /// records, so `is_free` would call it free:
 ///
-/// - below [`gex_abi::DISPATCH_DIR_END`]: the thread contexts and the dispatch
+/// - below [`gex_abi::image_floor`]: the thread contexts, and in an M32 memory the dispatch
 ///   directory. A guest mapping there wipes directory entries, and a hot block
 ///   then misses forever.
 /// - `[STACK_TOP, MMAP_BOTTOM)`, the gap between the guest's stack and the
@@ -612,7 +612,7 @@ fn arena_full(lo: u64, hi: u64, len: u64) {
 /// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
 ///   directory and patched-page bits.
 pub fn hits_runtime(start: u64, end: u64) -> bool {
-    start < gex_abi::DISPATCH_DIR_END
+    start < gex_abi::image_floor()
         || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
         || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
 }

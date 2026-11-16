@@ -10157,7 +10157,7 @@ impl Kernel {
         })
         .or_else(|| {
             let head = self.read_head(image, 4096)?;
-            pe_needs_mem64(&head).then_some(true)
+            (pe_needs_mem64(&head) || elf_needs_mem64(&head)).then_some(true)
         });
         // The new program's record, its own reservations to come.
         let was = std::mem::replace(&mut self.exec_mem64, want);
@@ -18160,9 +18160,32 @@ pub fn pe_needs_mem64(head: &[u8]) -> bool {
     parse().unwrap_or(false)
 }
 
+/// A 64-bit ELF executable fixed (ET_EXEC) with a segment below the lowered
+/// memory's dispatch directory end, which only a 64-bit memory leaves free:
+/// lld's default base for a non-PIE x86-64 image, 0x200000, is there
+/// (Chromium's, Steam's steamwebhelper). Only an x86-64 image, in an x86
+/// build: a 64-bit memory is for x86-64 guests. Headers that do not parse,
+/// or that fall outside `head`: false.
+pub fn elf_needs_mem64(head: &[u8]) -> bool {
+    let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u64_at = |o: usize| head.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    // An x86-64 executable (EM_X86_64), where a 64-bit memory exists.
+    if !gex_abi::X86 || head.get(..5) != Some(b"\x7fELF\x02") || u16_at(16) != Some(2) || u16_at(18) != Some(62) {
+        return false;
+    }
+    let (Some(phoff), Some(phent), Some(phnum)) = (u64_at(32), u16_at(54), u16_at(56)) else { return false };
+    (0..phnum).any(|i| {
+        let o = phoff as usize + i * phent;
+        u32_at(o) == Some(1)
+            && u64_at(o + 16).is_some_and(|va| va >= gex_abi::RESERVED_END && va < gex_abi::DISPATCH_DIR_END)
+            && u64_at(o + 40).is_some_and(|memsz| memsz != 0)
+    })
+}
+
 #[cfg(test)]
 mod pe_mem64_tests {
-    use super::pe_needs_mem64;
+    use super::{elf_needs_mem64, pe_needs_mem64};
 
     /// A minimal PE32+ header: `base`, `chars`, the relocation directory's size.
     fn pe(base: u64, chars: u16, relocs: u32, machine: u16) -> Vec<u8> {
@@ -18179,6 +18202,35 @@ mod pe_mem64_tests {
         b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
         b[opt + 112 + 44..opt + 112 + 48].copy_from_slice(&relocs.to_le_bytes());
         b
+    }
+
+    /// A 64-bit ELF header: type `ty` (2 ET_EXEC, 3 ET_DYN), machine
+    /// `machine`, one PT_LOAD at `vaddr` of `memsz` bytes.
+    fn elf(ty: u16, machine: u16, vaddr: u64, memsz: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 0x200];
+        b[..5].copy_from_slice(b"\x7fELF\x02");
+        b[16..18].copy_from_slice(&ty.to_le_bytes());
+        b[18..20].copy_from_slice(&machine.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes());
+        b[64 + 16..64 + 24].copy_from_slice(&vaddr.to_le_bytes());
+        b[64 + 40..64 + 48].copy_from_slice(&memsz.to_le_bytes());
+        b
+    }
+
+    /// A non-PIE x86-64 image at lld's 0x200000 (Chromium's) can only be
+    /// loaded in a 64-bit memory; one at gcc's 0x400000, a PIE, an AArch64
+    /// image or a 32-bit one can be loaded in either.
+    #[test]
+    fn a_low_fixed_x86_64_image_needs_mem64() {
+        assert_eq!(elf_needs_mem64(&elf(2, 62, 0x20_0000, 0x1000)), gex_abi::X86);
+        assert!(!elf_needs_mem64(&elf(2, 62, 0x40_0000, 0x1000)));
+        assert!(!elf_needs_mem64(&elf(3, 62, 0x20_0000, 0x1000)));
+        assert!(!elf_needs_mem64(&elf(2, 183, 0x20_0000, 0x1000)));
+        assert!(!elf_needs_mem64(&elf(2, 62, 0x20_0000, 0)));
+        assert!(!elf_needs_mem64(&elf(2, 62, 0x20_0000, 0x1000)[..40]));
     }
 
     #[test]

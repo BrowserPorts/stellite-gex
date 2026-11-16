@@ -3,7 +3,8 @@
 //! Nothing in this crate depends on anything else in gex.
 
 #![forbid(unsafe_code)]
-#![no_std]
+// `thread-flavor` (a native host): std, for a per-thread memory flavour.
+#![cfg_attr(not(feature = "thread-flavor"), no_std)]
 
 // ---------------------------------------------------------------------------
 // Guest architecture
@@ -105,15 +106,65 @@ pub fn set_mem_flavor(f: MemFlavor) {
     MEM64.store(f.is_64() || cfg!(target_arch = "wasm64"), core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The guest memory translations target: [`MemFlavor::M32`] unless
+// A native host's per-thread flavour (0 unset, 1 M32, 2 M64): every guest
+// process there is host threads of one gexc, and Steam's 32-bit client starts
+// a 64-bit Chromium that needs a 64-bit memory, so the flavour is each
+// process's own. The browser has a shim per process and keeps the global.
+#[cfg(feature = "thread-flavor")]
+std::thread_local! {
+    static THREAD_MEM: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
+
+/// This thread's own flavour (0 when it has none), for a thread that works
+/// for the same process to take with it: [`flavor_restore`] on the other side.
+pub fn flavor_capture() -> u8 {
+    #[cfg(feature = "thread-flavor")]
+    {
+        THREAD_MEM.with(|c| c.get())
+    }
+    #[cfg(not(feature = "thread-flavor"))]
+    {
+        0
+    }
+}
+
+/// Give this thread the flavour [`flavor_capture`] took (0: none of its own).
+pub fn flavor_restore(v: u8) {
+    #[cfg(feature = "thread-flavor")]
+    THREAD_MEM.with(|c| c.set(v));
+    #[cfg(not(feature = "thread-flavor"))]
+    let _ = v;
+}
+
+/// Set this thread's flavour, where the host keeps one per thread.
+pub fn set_thread_mem_flavor(f: MemFlavor) {
+    flavor_restore(if f.is_64() { 2 } else { 1 });
+}
+
+/// The guest memory translations target: this thread's when the host keeps
+/// one per thread (`thread-flavor`), else [`MemFlavor::M32`] unless
 /// [`set_mem_flavor`] said otherwise, or this is a wasm64 build (whose own
 /// memory is the guest's, so it can only emit for a 64-bit one).
 pub fn mem_flavor() -> MemFlavor {
-    if cfg!(target_arch = "wasm64") || MEM64.load(core::sync::atomic::Ordering::Relaxed) {
-        MemFlavor::M64
-    } else {
-        MemFlavor::M32
+    if cfg!(target_arch = "wasm64") {
+        return MemFlavor::M64;
     }
+    match flavor_capture() {
+        1 => MemFlavor::M32,
+        2 => MemFlavor::M64,
+        _ if MEM64.load(core::sync::atomic::Ordering::Relaxed) => MemFlavor::M64,
+        _ => MemFlavor::M32,
+    }
+}
+
+/// The lowest address a fixed-address image may occupy in this flavour's
+/// memory: above the thread contexts always, and above the dispatch
+/// directory where it is in the low region (M32). An M64 memory keeps its
+/// directory at [`DISPATCH_DIR64`], which leaves 0x100000..0x300000 to the
+/// program -- where lld puts a non-PIE x86-64 image (0x200000), Chromium's
+/// among them.
+pub fn image_floor() -> u64 {
+    if mem64() { RESERVED_END } else { DISPATCH_DIR_END }
 }
 
 /// `mem_flavor().is_64()`.

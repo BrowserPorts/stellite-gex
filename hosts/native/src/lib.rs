@@ -397,18 +397,21 @@ struct SpawnContext {
 struct ProcessModes {
     decode: gex_xlate::Modes,
     compat32: bool,
+    /// Its memory flavour (`gex_abi::flavor_capture`).
+    mem: u8,
 }
 
 impl ProcessModes {
     /// This thread's.
     fn here() -> ProcessModes {
-        ProcessModes { decode: gex_xlate::modes(), compat32: gex_kernel::compat32() }
+        ProcessModes { decode: gex_xlate::modes(), compat32: gex_kernel::compat32(), mem: gex_abi::flavor_capture() }
     }
 
     /// Make them this thread's.
     fn apply(self) {
         gex_xlate::set_modes(self.decode);
         gex_kernel::set_compat32(self.compat32);
+        gex_abi::flavor_restore(self.mem);
     }
 }
 
@@ -667,6 +670,10 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 /// is keyed by a 128-bit SipHash of the same fields, a few ms.
 fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
     use std::hash::{Hash, Hasher};
+    // A module is for one memory flavour (its addresses are i32 or i64), and
+    // a native host's processes each have their own (`exec_flavor`): the same
+    // image in two processes of different flavours is two modules.
+    let build = &if gex_abi::mem64() { format!("{build}+m64") } else { build.to_string() };
     static MEMO: Mutex<Vec<((u64, u64), String)>> = Mutex::new(Vec::new());
     let mut hs = [std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new()];
     hs[1].write_u64(0x9e37_79b9_7f4a_7c15);
@@ -761,6 +768,32 @@ fn x87_stats(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) {
 pub(crate) fn ppm_every() -> u32 {
     static EVERY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| std::env::var("GEX_PPM_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1))
+}
+
+/// The memory a program `execve` loads gets (docs/mem64.md §5), decided
+/// before it is loaded. A 32-bit program: M32, always. A 64-bit one: what
+/// the kernel says the exec asks for (`exec_mem64`: its GEX_MEM64 entry, its
+/// image's record or headers), or M64 for a name in `GEX_MEM64_EXE`
+/// (comma-separated file names), else the process's own. A native host's
+/// processes are threads of one host process, so each has its own flavour:
+/// Steam's 32-bit client starts a 64-bit Chromium that needs a 64-bit one.
+fn exec_flavor(bytes: &[u8], path: &str, asked: Option<bool>) -> gex_abi::MemFlavor {
+    use gex_abi::MemFlavor::{M32, M64};
+    if bytes.len() < 5 || &bytes[..4] != b"\x7fELF" {
+        return gex_abi::mem_flavor();
+    }
+    if bytes[4] != 2 {
+        return M32;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if std::env::var("GEX_MEM64_EXE").is_ok_and(|v| v.split(',').any(|n| !n.is_empty() && n == name)) {
+        return M64;
+    }
+    match asked {
+        Some(true) => M64,
+        Some(false) => M32,
+        None => gex_abi::mem_flavor(),
+    }
 }
 
 /// The guest memory's type: 4 GiB of wasm32, or for a 64-bit guest memory
@@ -956,6 +989,11 @@ fn run_program_with(
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
     let fresh_process = inherited.is_none();
+    // This process's memory flavour, on this thread: the run's for the first
+    // program (`gexc run` chose it), `exec_program`'s choice after an exec.
+    if fresh_process && gex_abi::flavor_capture() == 0 {
+        gex_abi::set_thread_mem_flavor(opts.mem);
+    }
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
@@ -3416,6 +3454,13 @@ fn exec_program(
     let bytes = kernel
         .read_file(&req.path)
         .ok_or_else(|| anyhow!("execve: cannot read {}", req.path))?;
+    // The new image's memory, before it is loaded: where it may be placed
+    // depends on it (`gex_abi::image_floor`).
+    let mem = exec_flavor(&bytes, &req.path, kernel.exec_mem64);
+    if mem != gex_abi::mem_flavor() && log_on() {
+        eprintln!("[gex] pid {}: {} runs with a {} memory", kernel.pid, req.path, if mem.is_64() { "64-bit" } else { "32-bit" });
+    }
+    gex_abi::set_thread_mem_flavor(mem);
     let program = gex_ld::load_program(
         &bytes,
         gex_abi::PIE_BASE,

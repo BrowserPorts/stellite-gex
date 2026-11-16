@@ -2455,7 +2455,7 @@ impl<'a> Emitter<'a> {
     ) {
         self.f.local_get(a);
         self.f.addr_add_const(static_off);
-        self.f.addr_const(gex_abi::GUEST_FLOOR);
+        self.f.addr_const(gex_abi::image_floor());
         self.f.addr_lt_u();
         self.f.if_void();
         self.flush_conditional();

@@ -131,7 +131,7 @@ impl fmt::Display for LoadError {
                 "segment at 0x{vaddr:x} (0x{size:x} bytes) lies in gex's reserved low region \
                  (below 0x{:x}: thread contexts and the dispatch directory); relink the \
                  program higher, e.g. with -Wl,--image-base=0x{:x}",
-                gex_abi::DISPATCH_DIR_END,
+                gex_abi::image_floor(),
                 gex_abi::PIE_BASE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
@@ -647,7 +647,7 @@ fn headers(r: &Reader, pie_base: u64) -> Result<Headers, LoadError> {
                 // is being measured or parsed (`closure::resolve` sizes every
                 // library at base 0), and where it really goes is the
                 // loader's or the kernel's placement, which never picks there.
-                if !pie && p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
+                if !pie && p_memsz != 0 && vaddr < gex_abi::image_floor() {
                     return Err(LoadError::InRuntimeRegion {
                         vaddr,
                         size: p_memsz,

@@ -93,6 +93,9 @@ impl Drop for Helper {
 /// not matter to the result.
 #[cfg(feature = "parallel")]
 fn spread(want: usize, work: &(dyn Fn() + Sync)) {
+    // The caller's memory flavour, which a native host keeps per thread (each
+    // guest process's own): the helpers translate for the same process.
+    let flavor = gex_abi::flavor_capture();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for _ in 1..want {
@@ -103,6 +106,7 @@ fn spread(want: usize, work: &(dyn Fn() + Sync)) {
             }
             match std::thread::Builder::new().name("gex-lift".into()).spawn_scoped(scope, move || {
                 let _place = place;
+                gex_abi::flavor_restore(flavor);
                 work();
             }) {
                 Ok(h) => handles.push(h),

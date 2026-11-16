@@ -12,3 +12,6 @@ description = "Shared layout contract between gex's compiler, kernel and runtime
 # choice because the instruction alignment (dispatch slot granularity) and the
 # syscall register convention are constants the emitter, kernel and shims bake in.
 x86 = []
+# A per-thread memory flavour (std): a native host, whose guest processes
+# are threads of one host process (`mem_flavor`).
+thread-flavor = []
