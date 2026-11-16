@@ -41,9 +41,11 @@ export class D3dPacer {
 
   /**
    * `unshown(client)`: the frames that client's D3D windows presented and
-   * the page has not shown (gexgl-mesa.cpp gex_gl_client_unshown).
+   * the page has not shown (gexgl-mesa.cpp gex_gl_client_unshown). The
+   * default timers are plain calls: a browser's setTimeout called as a method
+   * of this object throws "Illegal invocation" (Node's does not).
    */
-  constructor({ interval = 1, unshown, capMs = 50, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  constructor({ interval = 1, unshown, capMs = 50, setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (t) => clearTimeout(t) }) {
     this.#interval = interval;
     this.#unshown = unshown;
     this.#capMs = capMs;
