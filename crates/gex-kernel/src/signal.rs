@@ -593,6 +593,12 @@ impl Default for Signals {
 }
 
 impl Signals {
+    /// Another view of the same state: this process, this thread. What a
+    /// signalfd reads from (`crate::signalfd`).
+    pub fn share(&self) -> Signals {
+        Signals { proc: Arc::clone(&self.proc), cur: Arc::clone(&self.cur) }
+    }
+
     pub fn new() -> Signals {
         Signals {
             proc: Arc::new(ProcSig::with_actions([SigAction::default(); NSIG])),

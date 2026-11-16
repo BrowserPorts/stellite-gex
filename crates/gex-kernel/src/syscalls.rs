@@ -124,6 +124,9 @@ pub mod nr {
     pub const RT_SIGSUSPEND: u64 = 133;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    /// `signalfd4` (crate::signalfd); i386's and x86-64's `signalfd` is it
+    /// with no flags.
+    pub const SIGNALFD4: u64 = 74;
     pub const RT_SIGPENDING: u64 = 136;
     pub const RT_SIGRETURN: u64 = 139;
     pub const SIGALTSTACK: u64 = 132;
@@ -7738,6 +7741,10 @@ fn nosys_call(raw: u64, compat: bool) -> Option<FreeCall> {
     if matches!(n, nr::EXECVE | nr::CLONE | nr::CLONE3) {
         return None;
     }
+    // signalfd reads the process's signals, which only the full call has.
+    if n == nr::SIGNALFD4 {
+        return None;
+    }
     // A host answers the clocks and the ids before it classes a call
     // ([`clock_call`], [`ident_call`]); one that reaches here is answered
     // the same way.
@@ -11423,6 +11430,7 @@ impl Kernel {
             // blocking path takes the rest).
             nr::RT_SIGSUSPEND => Err(Errno::EFAULT),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
+            nr::SIGNALFD4 => self.sys_signalfd4(m, a[0] as i32, a[1], a[2], a[3]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
             // `kill`, `tkill` and `tgkill`, as the free path makes
@@ -11489,6 +11497,31 @@ impl Kernel {
         old: u64,
     ) -> SysResult {
         sigprocmask(&self.signals, m, how, set, old)
+    }
+
+    /// `signalfd4(fd, mask, sizemask, flags)`: a new signalfd reading `mask`
+    /// (fd -1), or a new mask for the one at `fd`. SIGKILL and SIGSTOP are
+    /// never read, as on Linux.
+    fn sys_signalfd4(&self, m: &mut GuestMem<'_>, fd: i32, mask_at: u64, size: u64, flags: u64) -> SysResult {
+        use crate::signalfd::SignalFd;
+        if size != 8 || flags & !(oflags::O_NONBLOCK | oflags::O_CLOEXEC) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mask = m.read_bits64(mask_at)? & !((1 << (9 - 1)) | (1 << (19 - 1)));
+        if fd != -1 {
+            let file = self.fds.get(fd)?;
+            let sfd = SignalFd::find(&file.handle).ok_or(Errno::EINVAL)?;
+            sfd.set_mask(mask);
+            return Ok(fd as u64);
+        }
+        let file = OpenFile::new(
+            SignalFd::new(self.signals.share(), mask),
+            "anon_inode:[signalfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
@@ -13336,6 +13369,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::TGKILL => "tgkill",
         nr::RT_SIGACTION => "rt_sigaction",
         nr::RT_SIGPROCMASK => "rt_sigprocmask",
+        nr::SIGNALFD4 => "signalfd4",
         nr::RT_SIGPENDING => "rt_sigpending",
         nr::RT_SIGRETURN => "rt_sigreturn",
         nr::SIGALTSTACK => "sigaltstack",
@@ -14745,7 +14779,8 @@ mod tests {
         }
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
+        // And signalfd, which reads the process's signals (`nosys_call`).
+        assert_eq!(locked, vec![nr::SIGNALFD4, nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
     }
 
     /// i386's `socketcall`, as Debian's i386 glibc makes every socket call,
@@ -14815,7 +14850,7 @@ mod tests {
         }
         use crate::i386::raw as x;
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes these i386 calls");
-        assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::CLONE3], "{locked:?}");
+        assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::SIGNALFD, x::SIGNALFD4, x::CLONE3], "{locked:?}");
     }
 
 

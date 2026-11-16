@@ -354,6 +354,8 @@ pub mod raw {
     pub const TIMERFD_GETTIME: u64 = 287;
     pub const ACCEPT4: u64 = 288;
     pub const EVENTFD2: u64 = 290;
+    pub const SIGNALFD: u64 = 282;
+    pub const SIGNALFD4: u64 = 289;
     pub const INOTIFY_INIT: u64 = 253;
     pub const INOTIFY_ADD_WATCH: u64 = 254;
     pub const INOTIFY_RM_WATCH: u64 = 255;
@@ -683,6 +685,11 @@ pub fn translate(
         x::TIMERFD_GETTIME => nr::TIMERFD_GETTIME,
         x::ACCEPT4 => nr::ACCEPT4,
         x::EVENTFD2 => nr::EVENTFD2,
+        x::SIGNALFD4 => nr::SIGNALFD4,
+        x::SIGNALFD => {
+            a[3] = 0;
+            nr::SIGNALFD4
+        }
         x::EPOLL_CREATE1 => nr::EPOLL_CREATE1,
         x::INOTIFY_INIT => {
             *a = [0; 6];

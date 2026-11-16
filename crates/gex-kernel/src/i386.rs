@@ -246,6 +246,8 @@ pub mod raw {
     pub const TIMERFD_GETTIME: u64 = 326;
     pub const FALLOCATE: u64 = 324;
     pub const EVENTFD2: u64 = 328;
+    pub const SIGNALFD: u64 = 321;
+    pub const SIGNALFD4: u64 = 327;
     pub const INOTIFY_INIT: u64 = 291;
     pub const INOTIFY_ADD_WATCH: u64 = 292;
     pub const INOTIFY_RM_WATCH: u64 = 293;
@@ -1006,6 +1008,14 @@ pub fn translate(
             nr::EPOLL_PWAIT2
         }
         x::EVENTFD2 => nr::EVENTFD2,
+        x::SIGNALFD4 => {
+            a[0] = sext(a[0]);
+            nr::SIGNALFD4
+        }
+        x::SIGNALFD => {
+            *a = [sext(a[0]), a[1], a[2], 0, 0, 0];
+            nr::SIGNALFD4
+        }
         x::INOTIFY_INIT => {
             *a = [0; 6];
             nr::INOTIFY_INIT1
