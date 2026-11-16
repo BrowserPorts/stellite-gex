@@ -111,6 +111,8 @@ fn list_dir(host: &Path, md: &Metadata) -> Result<Vec<DirEntry>, Errno> {
     // Each entry's type and inode as the directory read gives them
     // (d_type, d_ino), as Linux's getdents does: no call per entry. A
     // filesystem that gives no type is asked, by lstat.
+    // Their device is the directory's (a volume mounted beneath it aside).
+    let dev = std::fs::metadata(&host).map_or(0, |m| m.dev());
     for e in std::fs::read_dir(&host).map_err(|e| Errno::from_io(&e))? {
         use std::os::unix::fs::DirEntryExt;
         let e = e.map_err(|e| Errno::from_io(&e))?;
@@ -118,7 +120,7 @@ fn list_dir(host: &Path, md: &Metadata) -> Result<Vec<DirEntry>, Errno> {
         entries.push(DirEntry {
             name: e.file_name().to_string_lossy().into_owned(),
             file_type: entry_type(ft),
-            ino: e.ino(),
+            ino: guest_ino(e.ino(), dev),
         });
     }
     Ok(entries)
@@ -142,12 +144,22 @@ fn entry_type(t: std::fs::FileType) -> FileType {
     }
 }
 
+/// A host file's inode number as the guest sees it: the host's, with the
+/// host device mixed in. The guest's `st_dev` is the same for every file,
+/// so without it two volumes' files could share a number. Wine, walking up
+/// a path to find its drive by device and inode, took an external volume's
+/// root (inode 2) for `/`'s and named its files `Z:\` from the volume down,
+/// which then led nowhere. (The inotify keys keep the host's own numbers.)
+pub(crate) fn guest_ino(ino: u64, dev: u64) -> u64 {
+    ino ^ ((dev & 0xffff_ffff) << 32)
+}
+
 pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     Metadata {
         file_type: file_type_of(md),
         size: md.len(),
         mode: md.mode() & 0o7777,
-        ino: md.ino(),
+        ino: guest_ino(md.ino(), md.dev()),
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
         rdev: 0,
@@ -482,14 +494,18 @@ impl FileSystem for HostFs {
                 custom |= 0o200;
             }
         }
-        if flags & oflags::O_TRUNC != 0 {
+        // std refuses truncate with append (EINVAL), which Linux allows and
+        // Steam's logs open with: such a file is cut to nothing once open.
+        let append = flags & oflags::O_APPEND != 0;
+        let trunc_after = flags & oflags::O_TRUNC != 0 && want_write && append;
+        if flags & oflags::O_TRUNC != 0 && !trunc_after {
             if want_write {
                 opts.truncate(true);
             } else {
                 custom |= 0o1000;
             }
         }
-        if flags & oflags::O_APPEND != 0 {
+        if append {
             opts.append(true);
         }
         // O_NONBLOCK reaches the host: opening a host FIFO without a writer
@@ -500,6 +516,9 @@ impl FileSystem for HostFs {
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
+        if trunc_after && file.metadata().is_ok_and(|m| m.is_file()) {
+            file.set_len(0).map_err(|e| Errno::from_io(&e))?;
+        }
         // A FIFO, socket or device has no offset: read and write it as is.
         let stream = file.metadata().is_ok_and(|m| !m.is_file());
         let h = HostHandle {
@@ -841,6 +860,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gex-hostfs-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn truncate_with_append_cuts_the_file() {
+        // Linux allows O_TRUNC | O_APPEND, which std refuses; Steam's logs
+        // open so.
+        let dir = scratch();
+        std::fs::write(dir.join("log.txt"), b"old contents").unwrap();
+        let fs = HostFs::new(&dir);
+        let f = fs.open("log.txt", oflags::O_WRONLY | oflags::O_TRUNC | oflags::O_APPEND, 0).unwrap();
+        f.write_at(0, b"new").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(dir.join("log.txt")).unwrap(), b"new");
     }
 
     #[test]
