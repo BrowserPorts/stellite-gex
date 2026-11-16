@@ -1,5 +1,5 @@
 // D3D presents paced in the compositor (page/src/d3d-pacing.js): a client's
-// reply is held while it has more frames presented and unshown than its swap
+// reply is held while it has as many frames presented and unshown as its swap
 // interval, released when the page shows them or after the cap, and never
 // held at interval 0. The interval comes from Mesa's environment
 // (GEXGL_SWAP_INTERVAL in `?mesaenv=`).
@@ -34,10 +34,10 @@ export default async function (t) {
   };
   const settle = () => new Promise((r) => setTimeout(r, 0));
 
+  unshown.set(1, 0);
+  t.eq('nothing unshown: not held', hold(1), null);
   unshown.set(1, 1);
-  t.eq('one frame in flight: not held', hold(1), null);
-  unshown.set(1, 2);
-  t.check('two unshown at interval 1: held', hold(1) instanceof Promise);
+  t.check('one unshown at interval 1: held', hold(1) instanceof Promise);
   t.eq('held', pacer.held, 1);
   unshown.set(2, 0);
   t.eq('another client, nothing unshown: not held', hold(2), null);

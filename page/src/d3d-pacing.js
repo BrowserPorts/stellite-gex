@@ -9,12 +9,16 @@
 // passed over.
 //
 // The pacing is therefore here, where the frames are shown: after a D3D
-// client's submit, its reply is held while that client has more frames
-// presented and not yet shown than its swap interval -- one frame in flight
-// is normal -- and released when the page has shown them, or after a capped
-// wait so a page that stops showing (a hidden tab) slows the program rather
-// than wedging it, as GL's pacing does. The ring is one, so the hold is a
-// hold on the device: no other client's batch runs meanwhile either.
+// client's submit, its reply is held while that client has as many frames
+// presented and not yet shown as its swap interval, and released when the
+// page has shown them, or after a capped wait so a page that stops showing
+// (a hidden tab) slows the program rather than wedging it, as GL's pacing
+// does. A D3D window's frames are shown newest-first, so one present more
+// per shown frame would be drawn and passed over: paced, a program presents
+// once per frame the page shows. It draws its next frame while held -- the
+// unwaited submit has returned -- and waits only to send it. The ring is one,
+// so the hold is a hold on the device: no other client's batch runs
+// meanwhile either.
 //
 // The interval is the player's, as GL's GEXGL_SWAP_INTERVAL is: from the
 // environment the page gives Mesa (`?mesaenv=GEXGL_SWAP_INTERVAL=0`), since
@@ -60,7 +64,7 @@ export class D3dPacer {
   /** After a D3D client's submit: null when its reply may go now, else a
    *  promise that resolves when it may. */
   after(client) {
-    if (this.#interval <= 0 || this.#unshown(client) <= this.#interval) return null;
+    if (this.#interval <= 0 || this.#unshown(client) < this.#interval) return null;
     return new Promise((resolve) => {
       const w = { client, resolve, timer: null };
       w.timer = this.#setTimer(() => this.#release(w), this.#capMs);
@@ -71,7 +75,7 @@ export class D3dPacer {
   /** The page has shown frames: whoever is no longer too far ahead goes. */
   shown() {
     for (const w of [...this.#waiting])
-      if (this.#unshown(w.client) <= this.#interval) this.#release(w);
+      if (this.#unshown(w.client) < this.#interval) this.#release(w);
   }
 
   /** How many replies are being held. */
