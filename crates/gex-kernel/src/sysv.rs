@@ -16,7 +16,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
 
 use crate::errno::{Errno, SysResult};
 use crate::GuestMem;
@@ -60,7 +59,7 @@ struct Table {
     /// by a call that ended some other way ([`forget`] missed, a thread
     /// that died waiting, an address space reused) is not taken for a new
     /// call's.
-    deadlines: HashMap<(usize, u64), ((i32, u64, u64), Instant)>,
+    deadlines: HashMap<(usize, u64), ((i32, u64, u64), u64)>,
 }
 
 fn table() -> MutexGuard<'static, Table> {
@@ -103,9 +102,10 @@ pub enum Op {
 }
 
 /// `semtimedop(semid, sops, nsops, timeout)`, the `timeout` a 64-bit
-/// timespec or 0 for none; `who` names the calling thread (its address
-/// space and context) for the timeout, `pid` is recorded for `GETPID`.
-pub fn semop(m: &GuestMem<'_>, who: (usize, u64), pid: i32, id: i32, sops: u64, nsops: u64, timeout: u64) -> Result<Op, Errno> {
+/// timespec or 0 for none; `who` names the calling thread (its process and
+/// context) for the timeout, `pid` is recorded for `GETPID`, and `now_ns` is
+/// the kernel's monotonic clock (a browser Worker has no `Instant`).
+pub fn semop(m: &GuestMem<'_>, who: (usize, u64), pid: i32, id: i32, sops: u64, nsops: u64, timeout: u64, now_ns: u64) -> Result<Op, Errno> {
     if nsops == 0 {
         return Err(Errno::EINVAL);
     }
@@ -158,7 +158,7 @@ pub fn semop(m: &GuestMem<'_>, who: (usize, u64), pid: i32, id: i32, sops: u64, 
             Err(Errno::EAGAIN)
         }
         Some(_) if timeout != 0 => {
-            let now = Instant::now();
+            let now = now_ns;
             let call = (id, sops, timeout);
             let ends = match t.deadlines.get(&who) {
                 Some(&(c, d)) if c == call => d,
@@ -167,7 +167,7 @@ pub fn semop(m: &GuestMem<'_>, who: (usize, u64), pid: i32, id: i32, sops: u64, 
                     if nanos >= 1_000_000_000 {
                         return Err(Errno::EINVAL);
                     }
-                    let d = now + Duration::new(secs, nanos as u32);
+                    let d = now.saturating_add(secs.saturating_mul(1_000_000_000)).saturating_add(nanos);
                     t.deadlines.insert(who, (call, d));
                     d
                 }
@@ -288,19 +288,18 @@ mod tests {
         m.write_u64(0x20, 0).unwrap();
         m.write_u64(0x28, 50_000_000).unwrap();
         let who = (0x1234usize, 0x40u64);
-        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20), Ok(Op::Blocked)));
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(semop(&m, who, 1, id, 0x10, 1, 0x20).err(), Some(Errno::EAGAIN), "the retry keeps the first deadline");
+        const MS: u64 = 1_000_000;
+        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20, 1000 * MS), Ok(Op::Blocked)));
+        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20, 1040 * MS), Ok(Op::Blocked)), "before the deadline");
+        assert_eq!(semop(&m, who, 1, id, 0x10, 1, 0x20, 1060 * MS).err(), Some(Errno::EAGAIN), "the retry keeps the first deadline");
         // A signal ends the next call; the one after must wait afresh.
-        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20), Ok(Op::Blocked)));
-        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20, 1100 * MS), Ok(Op::Blocked)));
         forget(who);
-        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20), Ok(Op::Blocked)), "a new call, a new deadline");
+        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x20, 1160 * MS), Ok(Op::Blocked)), "a new call, a new deadline");
         // A stale deadline under other arguments is not this call's.
-        std::thread::sleep(Duration::from_millis(60));
         m.write_u64(0x38, 50_000_000).unwrap();
         m.write_u64(0x30, 0).unwrap();
-        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x30), Ok(Op::Blocked)));
+        assert!(matches!(semop(&m, who, 1, id, 0x10, 1, 0x30, 1220 * MS), Ok(Op::Blocked)));
         forget(who);
         semctl(&mut m, id, 0, IPC_RMID, 0, false).unwrap();
     }

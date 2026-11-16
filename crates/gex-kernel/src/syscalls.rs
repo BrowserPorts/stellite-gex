@@ -11211,7 +11211,7 @@ impl Kernel {
             nr::SEMTIMEDOP | nr::SEMOP => {
                 let who = (self.pid as usize, self.ctx_addr);
                 let timeout = if n == nr::SEMOP { 0 } else { a[3] };
-                match crate::sysv::semop(m, who, self.pid, a[0] as i32, a[1], a[2], timeout) {
+                match crate::sysv::semop(m, who, self.pid, a[0] as i32, a[1], a[2], timeout, raw_ns(self.clock)) {
                     Ok(crate::sysv::Op::Done) => self.sem_result = Some(Ok(0)),
                     Err(e) => self.sem_result = Some(Err(e)),
                     // A wasm32 program's restart goes by a handler frame
