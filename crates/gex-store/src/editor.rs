@@ -15,7 +15,7 @@
 use crate::alloc::Allocator;
 use crate::format::{self, Blocks, Body, Found, Journal, Rec};
 use crate::{Errno, OP_READ, OP_WRITE};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// The store file, as the editor's host reaches it: one call per operation,
 /// as `blocks.mjs` `handleOp` answers it.
@@ -531,6 +531,115 @@ impl<I: Io> Editor<I> {
         }
     }
 
+    /// Where the file at `path` has its bytes in the store file: runs of
+    /// `(offset, length)` in order, `None` for a hole (zeros). EINVAL for a
+    /// file kept in its record (read it instead).
+    pub fn runs(&self, path: &str) -> Result<Vec<(Option<u64>, u64)>, Errno> {
+        let (size, map) = match self.recs.get(&key(path)?) {
+            Some(Rec::File { body: Body::Blocks(size, map), .. }) => (*size, map),
+            Some(Rec::File { body: Body::Inline(_), .. }) => return Err(Errno::EINVAL),
+            Some(Rec::File { body: Body::Lazy(..), .. }) => return Err(Errno::ENXIO),
+            Some(_) => return Err(Errno::EINVAL),
+            None => return Err(Errno::ENOENT),
+        };
+        let bs = self.s.bs;
+        let mut out: Vec<(Option<u64>, u64)> = Vec::new();
+        let mut at = 0u64;
+        for (b, &place) in map.iter().enumerate() {
+            if at >= size {
+                break;
+            }
+            let len = (size - at).min(bs);
+            let off = if place == 0 { None } else { Some((place - 1) as u64 * bs) };
+            match (out.last_mut(), off) {
+                (Some((Some(o), l)), Some(n)) if *o + *l == n => *l += len,
+                (Some((None, l)), None) => *l += len,
+                _ => out.push((off, len)),
+            }
+            at = (b as u64 + 1) * bs;
+        }
+        if at < size {
+            // Past the block list: a hole to the end.
+            out.push((None, size - at));
+        }
+        Ok(out)
+    }
+
+    /// The records at or under any of `only` (absolute paths; every record
+    /// when empty) written into `dest`, a store opened empty, with their
+    /// files' bytes packed into its blocks; then every record written there
+    /// as one checkpoint. Modes, times, extended attributes and hard links
+    /// are kept; a lazy file stays lazy. `progress(done, total)` in bytes
+    /// after each piece; returning false stops the copy (ECANCELED), and
+    /// `dest` is then left with no generation of it written.
+    pub fn copy_into<J: Io>(&mut self, dest: &mut Editor<J>, only: &[String], progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), Errno> {
+        const ECANCELED: Errno = Errno(125);
+        const PIECE: u64 = 16 << 20;
+        if dest.found != Found::Fresh || !dest.recs.is_empty() {
+            return Err(Errno::EEXIST);
+        }
+        let keys: Vec<String> = only.iter().map(|p| if p.trim_matches('/').is_empty() { Ok(String::new()) } else { key(p) }).collect::<Result<_, _>>()?;
+        let wanted = |p: &str| keys.is_empty() || keys.iter().any(|k| under(p, k));
+        let paths: Vec<String> = self.recs.keys().filter(|p| wanted(p)).cloned().collect();
+        let total: u64 = paths.iter().filter_map(|p| if let Some(Rec::File { body: Body::Blocks(size, _), .. }) = self.recs.get(p) { Some(*size) } else { None }).sum();
+        let mut done = 0u64;
+        // The files the copy makes are numbered past every file here, so
+        // that none is taken for a link of one copied with its own number.
+        dest.next_ino = self.next_ino.max(dest.next_ino);
+        // A file's bytes are copied once, at its first path; its other
+        // paths (hard links) take the same record.
+        let mut copied: HashMap<u64, Rec> = HashMap::new();
+        let mut buf = Vec::new();
+        for p in paths {
+            let r = self.recs[&p].clone();
+            let out = match r {
+                Rec::File { ino, mode, mtime, body: Body::Blocks(size, _), xattrs } => {
+                    if let Some(r) = copied.get(&ino) {
+                        r.clone()
+                    } else {
+                        let at_path = format!("/{p}");
+                        let mut at = 0u64;
+                        dest.write(&at_path, 0, &[], mode, mtime, true)?;
+                        while at < size {
+                            let n = (size - at).min(PIECE) as usize;
+                            buf.resize(n, 0);
+                            let got = self.read(&at_path, at, &mut buf[..n])?;
+                            dest.write(&at_path, at, &buf[..got], mode, mtime, false)?;
+                            at += got as u64;
+                            done += got as u64;
+                            if !progress(done, total) {
+                                return Err(ECANCELED);
+                            }
+                            if got == 0 {
+                                break;
+                            }
+                        }
+                        let mut r = dest.recs.remove(p.as_str()).ok_or(Errno::EIO)?;
+                        if let Rec::File { xattrs: x, ino: i, .. } = &mut r {
+                            *x = xattrs;
+                            *i = ino;
+                        }
+                        copied.insert(ino, r.clone());
+                        r
+                    }
+                }
+                other => other,
+            };
+            dest.put(p, out);
+        }
+        // Its inode numbers are this store's: one per file, links shared.
+        dest.next_ino = dest.recs.values().filter_map(|r| if let Rec::File { ino, .. } = r { Some(ino + 1) } else { None }).max().unwrap_or(1);
+        dest.commit(true)?;
+        progress(done, total);
+        Ok(())
+    }
+
+    /// How long the store file needs to be: through its highest block in
+    /// use (the allocator grows the file ahead of that).
+    pub fn used_len(&self) -> u64 {
+        self.s.alloc.high() as u64 * self.s.bs
+    }
+
     /// The host, back.
     pub fn into_io(self) -> I {
         self.s.io
@@ -707,5 +816,46 @@ mod tests {
         assert_eq!(e.stat("/m2").unwrap().mode, 0o600);
         assert_eq!(read_all(&mut e, "/other"), b"other");
         assert!(e.stat("/m").is_err());
+    }
+
+    #[test]
+    fn a_compacting_copy_keeps_only_the_paths_asked_for_packed() {
+        let mut src = Mem::default();
+        let mut e = Editor::open(&mut src, BS, 512).unwrap();
+        // Scattered: a dropped file between the kept ones' blocks.
+        e.write("/keep/big", 0, &big(3 * BS as usize + 7, 1), 0o755, 11, true).unwrap();
+        e.write("/drop/f", 0, &big(5 * BS as usize, 2), 0o644, 0, true).unwrap();
+        e.write("/keep/big", 3 * BS + 7, &big(BS as usize, 3), 0o755, 11, false).unwrap();
+        e.write("/keep/small", 0, b"small", 0o600, 12, true).unwrap();
+        e.symlink("big", "/keep/link").unwrap();
+        e.remove("/etc/gone", true).unwrap();
+        e.commit(false).unwrap();
+        let mut dst = Mem::default();
+        let mut d = Editor::open(&mut dst, BS, 512).unwrap();
+        let mut seen = 0;
+        e.copy_into(&mut d, &["/keep".into(), "/etc".into()], &mut |done, total| {
+            seen = done;
+            assert!(done <= total);
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, 4 * BS + 7);
+        drop(d);
+        let mut want = big(3 * BS as usize + 7, 1);
+        want.extend(big(BS as usize, 3));
+        let mut e = Editor::open(&mut src, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/keep/big"), want);
+        let mut d = Editor::open(&mut dst, BS, 512).unwrap();
+        let paths: Vec<String> = d.list("/").unwrap().into_iter().map(|x| x.path).collect();
+        assert_eq!(paths, ["/etc/gone", "/keep/big", "/keep/link", "/keep/small"]);
+        assert_eq!(read_all(&mut d, "/keep/big"), want);
+        assert_eq!(read_all(&mut d, "/keep/small"), b"small");
+        assert_eq!((d.stat("/keep/big").unwrap().mode, d.stat("/keep/big").unwrap().mtime), (0o755, 11));
+        assert_eq!(d.stat("/etc/gone").unwrap().kind, Kind::Gone);
+        // Packed: the big file in one run, and the store no longer than its
+        // blocks, its records' and the superblocks'.
+        assert_eq!(d.runs("/keep/big").unwrap().len(), 1);
+        assert_eq!(d.used_len(), d.s.alloc.high() as u64 * BS);
+        assert!(d.s.alloc.high() < 4 + 1 + 1 + 4 + 2 + 64, "{}", d.s.alloc.high());
     }
 }

@@ -41,17 +41,66 @@ function moduleFor(url) {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/** store.wasm instantiated over `handles` (its stores 0 and 1), a copy's
+ *  progress to `onProgress`, which stops it by returning false. */
+async function instantiate(mod, handles, onProgress = () => true) {
+  let memory = null;
+  const { exports: x } = await WebAssembly.instantiate(mod, {
+    store: {
+      // blocks.mjs answers the kernel's store the same way: every count
+      // checked, anything short a failure.
+      io: (which, op, offset, ptr, len) => {
+        const r = handleOp(handles[which], true, memory, op, Number(offset), ptr, len);
+        if (r === NOSPACE) return -28;
+        return r < 0 ? -5 : 0;
+      },
+      progress: (done, total) => (onProgress(done, total) === false ? 0 : 1),
+    },
+  });
+  memory = x.memory;
+  return x;
+}
+
+/** The store `name`'s file, made if missing, and its sync access handle
+ *  (tried again while a system or Store just closed lets it go). */
+async function storeFile(name) {
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle(storeDir(name), { create: true });
+  const fh = await dir.getFileHandle(STORE_FILE, { create: true });
+  return { fh, h: await openHandle(fh) };
+}
+
+/** store.wasm's module for `Store.open`'s and `Store.copy`'s options. */
+function wasmModule({ baseUrl, wasm }) {
+  if (wasm instanceof WebAssembly.Module) return wasm;
+  const own = baseUrl == null ? files?.['gex/store.wasm'] : undefined;
+  return moduleFor(String(wasm ?? own ?? new URL('gex/store.wasm', new URL(baseUrl ?? DEFAULT_BASE(), globalThis.location?.href)).href));
+}
+
+const checkName = (what, name) => {
+  name = String(name ?? '');
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new TypeError(`${what}: name the store (letters, digits, . _ -)`);
+  return name;
+};
+const inWorker = (what) => {
+  if (typeof FileSystemFileHandle !== 'function' || !('createSyncAccessHandle' in FileSystemFileHandle.prototype)) {
+    throw new Error(`${what}: a store is edited from a dedicated Worker (a sync access handle is had only there)`);
+  }
+};
+
 export class Store {
   #name;
   #x;
+  #fh;
   #h;
   #claim;
   #found;
   #closed = false;
 
-  constructor(name, x, h, claim, found) {
+  constructor(name, x, fh, h, claim, found) {
     this.#name = name;
     this.#x = x;
+    this.#fh = fh;
     this.#h = h;
     this.#claim = claim;
     this.#found = found;
@@ -65,42 +114,94 @@ export class Store {
    * keeps something no generation of which reads: it is never written then.
    */
   static async open(name, { wait = false, signal, baseUrl, wasm } = {}) {
-    name = String(name ?? '');
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new TypeError('Store.open: name the store (letters, digits, . _ -)');
-    if (typeof FileSystemFileHandle !== 'function' || !('createSyncAccessHandle' in FileSystemFileHandle.prototype)) {
-      throw new Error('Store.open: a store is edited from a dedicated Worker (a sync access handle is had only there)');
-    }
-    const own = baseUrl == null ? files?.['gex/store.wasm'] : undefined;
-    const url = wasm instanceof WebAssembly.Module ? null
-      : String(wasm ?? own ?? new URL('gex/store.wasm', new URL(baseUrl ?? DEFAULT_BASE(), globalThis.location?.href)).href);
-    const mod = url ? await moduleFor(url) : wasm;
+    name = checkName('Store.open', name);
+    inWorker('Store.open');
+    const mod = await wasmModule({ baseUrl, wasm });
     const claim = await claimStore(name, { wait, signal });
     if (!claim) throw fail('Store.open', 16, `the store ${name} is open in another tab`);
     let h = null;
     try {
-      const root = await navigator.storage.getDirectory();
-      const dir = await root.getDirectoryHandle(storeDir(name), { create: true });
-      h = await openHandle(await dir.getFileHandle(STORE_FILE, { create: true }));
-      let memory = null;
-      const { exports: x } = await WebAssembly.instantiate(mod, {
-        store: {
-          // blocks.mjs answers the kernel's store the same way: every count
-          // checked, anything short a failure.
-          io: (op, offset, ptr, len) => {
-            const r = handleOp(h, true, memory, op, Number(offset), ptr, len);
-            if (r === NOSPACE) return -28;
-            return r < 0 ? -5 : 0;
-          },
-        },
-      });
-      memory = x.memory;
+      const f = await storeFile(name);
+      h = f.h;
+      const x = await instantiate(mod, [h]);
       const found = x.st_open(BLOCK, INLINE);
       if (found < 0) throw fail('Store.open', -found, name);
-      return new Store(name, x, h, claim, FOUND[found]);
+      return new Store(name, x, f.fh, h, claim, FOUND[found]);
     } catch (e) {
       h?.close();
       claim.release();
       throw e;
+    }
+  }
+
+  /**
+   * The store `from` copied into `to`, replacing what `to` held, while
+   * neither is open. Raw (the default): the store file's bytes, 16 MiB at
+   * a time, written in place, so the copy needs no room beyond its own.
+   * Compacting (`compact`, or any `only`): the records at or under the
+   * paths in `only` (every record when none), their files' bytes packed
+   * into a new store and its records written as one generation; what the
+   * filter leaves out is not in the copy. `onProgress(done, total)` in
+   * bytes; `signal` stops it, leaving `to` unusable (erase it). `wait`, as
+   * `open`'s, for both stores.
+   */
+  static async copy(from, to, { only, compact = !!only?.length, onProgress, signal, wait = false, baseUrl, wasm } = {}) {
+    from = checkName('Store.copy', from);
+    to = checkName('Store.copy', to);
+    if (from === to) throw new TypeError('Store.copy: a store is not copied into itself');
+    inWorker('Store.copy');
+    const mod = compact ? await wasmModule({ baseUrl, wasm }) : null;
+    const claims = [];
+    const handles = [];
+    try {
+      for (const name of [from, to]) {
+        const c = await claimStore(name, { wait, signal });
+        if (!c) throw fail('Store.copy', 16, `the store ${name} is open in another tab`);
+        claims.push(c);
+      }
+      for (const name of [from, to]) handles.push((await storeFile(name)).h);
+      const [src, dst] = handles;
+      const stop = () => signal?.aborted;
+      if (!compact) {
+        const size = src.getSize();
+        const buf = new Uint8Array(PIECE);
+        for (let at = 0; at < size;) {
+          if (stop()) throw signal.reason ?? new DOMException('Store.copy stopped', 'AbortError');
+          const n = src.read(buf.subarray(0, Math.min(PIECE, size - at)), { at });
+          if (!n) throw fail('Store.copy', 5, from);
+          // A short count is a failure (blocks.mjs): no room, a dead handle.
+          if (dst.write(buf.subarray(0, n), { at }) !== n) throw fail('Store.copy', 28, to);
+          at += n;
+          onProgress?.(at, size);
+        }
+        dst.truncate(size);
+        dst.flush();
+        return;
+      }
+      dst.truncate(0);
+      const x = await instantiate(mod, handles, (done, total) => (stop() ? false : (onProgress?.(done, total), true)));
+      let r = x.st_open(BLOCK, INLINE);
+      if (r < 0) throw fail('Store.copy', -r, from);
+      r = x.st_open_dest(BLOCK, INLINE);
+      if (r < 0) throw fail('Store.copy', -r, to);
+      const list = enc.encode((only ?? []).join('\n'));
+      const p = x.st_alloc(list.length);
+      new Uint8Array(x.memory.buffer, p, list.length).set(list);
+      r = x.st_copy(p, list.length);
+      x.st_dealloc(p, list.length);
+      // A compacted store ends at its last block, not where it was grown to.
+      const len = x.st_dest_len();
+      x.st_close_dest();
+      if (r >= 0 && len > 0) {
+        dst.truncate(len);
+        dst.flush();
+      }
+      x.st_close();
+      if (r === -125) throw signal?.reason ?? new DOMException('Store.copy stopped', 'AbortError');
+      if (r < 0) throw fail('Store.copy', -r, to);
+    } finally {
+      for (const h of handles) h.close();
+      for (const c of claims) c.release();
     }
   }
 
@@ -183,6 +284,24 @@ export class Store {
   readlink(path) {
     const n = this.#check('readlink', this.#with(path, (p, l) => this.#x.st_readlink(p, l)), path);
     return this.#text(n);
+  }
+
+  /**
+   * The file at `path` as a Blob that reads its bytes only when asked: the
+   * slices of the store file they are in. The editor never writes over a
+   * block a generation names, but the browser lets a slice of a file be
+   * read only while the file is as it was when the slice was taken (Chrome
+   * 157: a `write` and `commit` after it, and the slice throws
+   * NotReadableError). Read it before changing the store, or take
+   * `read`'s bytes instead.
+   */
+  async blob(path) {
+    const x = this.#live();
+    const n = this.#with(path, (p, l) => x.st_runs(p, l));
+    if (n === -22) return new Blob([this.read(path)]);
+    const runs = JSON.parse(this.#text(this.#check('blob', n, path)));
+    const file = await this.#fh.getFile();
+    return new Blob(runs.map(([off, len]) => (off < 0 ? new Uint8Array(len) : file.slice(off, off + len))));
   }
 
   /** The file's bytes, or `length` of them from `offset`. */

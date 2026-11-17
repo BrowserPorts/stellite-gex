@@ -27,6 +27,18 @@ export interface StoreOpenOptions {
 export class Store {
   static open(name: string, options?: StoreOpenOptions): Promise<Store>;
   static erase(name: string, options?: { wait?: boolean; signal?: AbortSignal }): Promise<void>;
+  /** `from` copied into `to`, replacing it: raw (the store file's bytes, in
+   *  place), or compacting (`compact`, or any `only`): the records at or
+   *  under `only`'s paths, their bytes packed into a new store. */
+  static copy(from: string, to: string, options?: {
+    only?: string[];
+    compact?: boolean;
+    onProgress?: (done: number, total: number) => void;
+    signal?: AbortSignal;
+    wait?: boolean;
+    baseUrl?: string | URL;
+    wasm?: string | URL | WebAssembly.Module;
+  }): Promise<void>;
   readonly name: string;
   readonly found: 'fresh' | 'restored' | 'fell-back';
   readonly generation: number;
@@ -34,6 +46,9 @@ export class Store {
   stat(path: string): StoreEntry;
   readlink(path: string): string;
   read(path: string, options?: { offset?: number; length?: number }): Uint8Array;
+  /** The file as a Blob that reads its bytes when asked; unreadable
+   *  (NotReadableError) once the store is written again. */
+  blob(path: string): Promise<Blob>;
   write(path: string, data: Uint8Array | ArrayBuffer | Blob | string, options?: { offset?: number; truncate?: boolean; mode?: number; mtime?: number }): Promise<void>;
   remove(path: string, options?: { hide?: boolean }): void;
   mkdir(path: string, options?: { mode?: number; mtime?: number }): void;

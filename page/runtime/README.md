@@ -459,6 +459,8 @@ one whose newest is torn opens the one before (`found` is `'fell-back'`).
 | --- | --- |
 | `Store.open(name, { wait, signal, baseUrl })` | Opens it; `EBUSY` at once if another page or Worker holds it, unless `wait`. |
 | `Store.erase(name)` | Removes the store. |
+| `Store.copy(from, to, { only, compact, onProgress, signal })` | Copies a store into another, replacing it, while neither is open. Raw by default: the store file's bytes, 16 MiB at a time, written in place, so it needs no room beyond the copy. Compacting with `compact` or `only`: the records at or under `only`'s paths (all when none), their bytes packed, written as one generation; the paths left out are not in the copy. |
+| `blob(path)` | The file as a Blob of slices of the store file, read when asked. The browser refuses a slice once its file has changed: after a later `write`, `commit` or run it throws `NotReadableError`, so read it first or take `read`'s bytes. |
 | `list(prefix)`, `stat(path)`, `readlink(path)`, `read(path, { offset, length })` | The records, and a file's bytes. |
 | `write(path, data, { offset, truncate, mode, mtime })` | A file written, replaced unless `offset` or `truncate: false`. |
 | `remove(path, { hide })` | The record and everything under it gone; `hide` also removes what the sources have there. |

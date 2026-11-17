@@ -1,9 +1,11 @@
 //! store.wasm: gex-store's offline editor ([`gex_store::editor`]) for the
 //! page (page/runtime/src/store.js), one store per instance.
 //!
-//! The page answers one import, `store.io(op, offset, ptr, len)`, against
-//! the store file's sync access handle (`blocks.mjs` `handleOp`): 0, or a
-//! negative errno. Every export answers 0 or more on success and a negative
+//! The page answers `store.io(which, op, offset, ptr, len)` against a store
+//! file's sync access handle (`blocks.mjs` `handleOp`): 0, or a negative
+//! errno. `which` is 0 for the store opened (`st_open`), 1 for a copy's
+//! destination (`st_open_dest`). A copy reports with `store.progress(done,
+//! total)`, which answers 0 to stop it. Every export answers 0 or more on success and a negative
 //! errno on failure; one that returns text (a listing, a record, a link's
 //! target) leaves it at `st_out()` and answers its length. Strings and
 //! buffers are in this module's memory, from `st_alloc`.
@@ -15,16 +17,18 @@ use std::cell::RefCell;
 
 #[link(wasm_import_module = "store")]
 extern "C" {
-    fn io(op: u32, offset: u64, ptr: *mut u8, len: u32) -> i32;
+    fn io(which: u32, op: u32, offset: u64, ptr: *mut u8, len: u32) -> i32;
+    fn progress(done: f64, total: f64) -> i32;
 }
 
-struct Host;
+/// Store 0 (the one opened) or 1 (a copy's destination).
+struct Host(u32);
 
 impl Io for Host {
     fn op(&mut self, op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         // SAFETY: the page reads or writes `len` bytes at `ptr`, in this
         // module's memory, and nothing else.
-        let r = unsafe { io(op, off, buf.as_mut_ptr(), buf.len() as u32) };
+        let r = unsafe { io(self.0, op, off, buf.as_mut_ptr(), buf.len() as u32) };
         if r < 0 {
             Err(Errno(-r))
         } else {
@@ -35,6 +39,7 @@ impl Io for Host {
 
 thread_local! {
     static ED: RefCell<Option<Editor<Host>>> = const { RefCell::new(None) };
+    static DEST: RefCell<Option<Editor<Host>>> = const { RefCell::new(None) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -120,7 +125,7 @@ pub extern "C" fn st_out() -> *const u8 {
 /// newest torn); EIO when nothing reads.
 #[no_mangle]
 pub extern "C" fn st_open(bs: u32, inline: u32) -> i32 {
-    code(Editor::open(Host, bs as u64, inline as u64).map(|ed| {
+    code(Editor::open(Host(0), bs as u64, inline as u64).map(|ed| {
         let f = match ed.found() {
             Found::Fresh => 0,
             Found::Restored => 1,
@@ -250,4 +255,61 @@ pub unsafe extern "C" fn st_rename(a: *const u8, an: u32, b: *const u8, bn: u32)
 #[no_mangle]
 pub extern "C" fn st_commit(checkpoint: u32) -> i32 {
     code(with(|e| e.commit(checkpoint != 0).map(|w| w as i32)))
+}
+
+/// Open a copy's destination (store 1), which must be empty.
+#[no_mangle]
+pub extern "C" fn st_open_dest(bs: u32, inline: u32) -> i32 {
+    code(Editor::open(Host(1), bs as u64, inline as u64).map(|ed| {
+        DEST.with(|d| *d.borrow_mut() = Some(ed));
+        0
+    }))
+}
+
+/// How long the destination's file needs to be, once a copy is written:
+/// a compacted store is cut to it.
+#[no_mangle]
+pub extern "C" fn st_dest_len() -> f64 {
+    DEST.with(|d| d.borrow().as_ref().map_or(-1.0, |e| e.used_len() as f64))
+}
+
+#[no_mangle]
+pub extern "C" fn st_close_dest() {
+    DEST.with(|d| *d.borrow_mut() = None);
+}
+
+/// The records under any of the paths (newline-separated; all when empty)
+/// copied into the destination, packed, and written there as a checkpoint
+/// (gex_store::editor::Editor::copy_into).
+///
+/// # Safety
+/// See [`text`].
+#[no_mangle]
+pub unsafe extern "C" fn st_copy(p: *const u8, n: u32) -> i32 {
+    code(text(p, n).and_then(|list| {
+        let only: Vec<String> = list.split('\n').filter(|s| !s.is_empty()).map(String::from).collect();
+        DEST.with(|d| {
+            let mut d = d.borrow_mut();
+            let dest = d.as_mut().ok_or(Errno::EINVAL)?;
+            // SAFETY: the page's progress takes two numbers.
+            with(|e| e.copy_into(dest, &only, &mut |done, total| unsafe { progress(done as f64, total as f64) } != 0).map(|()| 0))
+        })
+    }))
+}
+
+/// Where the file's bytes are in the store file, as JSON `[[offset,
+/// length], ...]`, offset -1 for a hole; EINVAL for a file kept in its
+/// record.
+///
+/// # Safety
+/// See [`text`].
+#[no_mangle]
+pub unsafe extern "C" fn st_runs(p: *const u8, n: u32) -> i32 {
+    code(text(p, n).and_then(|path| {
+        with(|e| {
+            let runs = e.runs(path)?;
+            let parts: Vec<String> = runs.iter().map(|(o, l)| format!("[{},{}]", o.map_or(-1, |o| o as i64), l)).collect();
+            out(format!("[{}]", parts.join(",")))
+        })
+    }))
 }
