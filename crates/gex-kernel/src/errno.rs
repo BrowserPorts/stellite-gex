@@ -7,6 +7,13 @@
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Errno(pub i32);
 
+/// gex-store's failures are the kernel's errnos.
+impl From<gex_store::Errno> for Errno {
+    fn from(e: gex_store::Errno) -> Errno {
+        Errno(e.0)
+    }
+}
+
 impl Errno {
     pub const EPERM: Errno = Errno(1);
     pub const ENOENT: Errno = Errno(2);
