@@ -2,15 +2,20 @@
 //! `gex-fs-<name>/blocks`, a page's own store): its format and its blocks,
 //! in one place for whatever reads or writes the store.
 //!
-//! The kernel (gex-kernel `vfs::persist`, `vfs::blocks`) keeps the running
-//! tree's changes in it: [`format`] writes and reads its generations, and
-//! [`alloc::Allocator`] places its blocks.
+//! - The kernel (gex-kernel `vfs::persist`, `vfs::blocks`) keeps the running
+//!   tree's changes in it: [`format`] writes and reads its generations, and
+//!   [`alloc::Allocator`] places its blocks.
+//! - The page's offline editor ([`editor::Editor`], built alone as
+//!   `store.wasm` by hosts/store) reads and writes the same records while no
+//!   system holds the store: a file written there is one the next boot lays,
+//!   and the records a run wrote are kept as they are.
 //!
 //! The store is one file of blocks of one size. Block 0 holds the two
 //! superblocks; the rest are the records' chain and the files' bytes
 //! ([`format`] says how).
 
 pub mod alloc;
+pub mod editor;
 pub mod format;
 
 /// A failure, as the kernel's errno: EIO, ENOSPC, and the like.

@@ -24,6 +24,7 @@ members = [
     "crates/gex-ld",
     "crates/gex-kernel",
     "crates/gex-store",
+    "hosts/store",
     "crates/gex-wayland",
     "crates/gex-xwm",
     "crates/gex-gpu",

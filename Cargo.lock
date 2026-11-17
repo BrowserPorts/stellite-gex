@@ -808,6 +808,13 @@ name = "gex-store"
 version = "0.0.1"
 
 [[package]]
+name = "gex-store-wasm"
+version = "0.0.1"
+dependencies = [
+ "gex-store",
+]
+
+[[package]]
 name = "gex-units"
 version = "0.0.1"
 dependencies = [
