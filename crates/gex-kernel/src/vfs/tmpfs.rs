@@ -1401,6 +1401,7 @@ impl TmpFs {
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.nlink(ino),
                 rdev: 0,
+                dev: 0,
                 times: f.times(),
             }),
             Node::Dir => {
@@ -1421,6 +1422,7 @@ impl TmpFs {
                 mtime: mtime(),
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
                 times: Default::default(),
             }),
             Node::Socket => Ok(Metadata {
@@ -1431,6 +1433,7 @@ impl TmpFs {
                 mtime: mtime(),
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
                 times: Default::default(),
             }),
         }
@@ -1670,6 +1673,7 @@ impl FileHandle for TmpHandle {
                 mtime: file.mtime.load(Ordering::Relaxed),
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
                 times: file.times(),
             });
         }
