@@ -244,9 +244,8 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 
 impl FileHandle for HostHandle {
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
-        use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+        Some(host_xattr::call(host_xattr::On::Fd(&f), op))
     }
 
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
@@ -320,9 +319,8 @@ struct HostDir {
 
 impl FileHandle for HostDir {
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
-        use std::os::unix::io::AsRawFd;
         let (f, _, _) = self.held.as_ref()?;
-        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+        Some(host_xattr::call(host_xattr::On::Fd(f), op))
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
@@ -337,22 +335,28 @@ impl FileHandle for HostDir {
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         use std::os::fd::AsRawFd;
         let at = match &self.held {
+            // Linux lists the descriptor itself through its /proc link
             Some((f, _, _)) if cfg!(target_os = "linux") => PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd())),
-            _ => self.host.clone(),
+            // elsewhere, where the host says it is now (`getdents` on a
+            // directory removed fails with ENOENT)
+            Some((f, _, _)) => match (crate::hostos::calls().fd_path)(f.as_raw_fd()) {
+                Some(Ok(now)) => now,
+                Some(Err(e)) => return Err(e),
+                None => self.host.clone(),
+            },
+            None => self.host.clone(),
         };
         list_dir(&at, &self.md)
     }
-    #[cfg(target_os = "linux")]
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {
         use std::os::fd::AsRawFd;
         let (file, was, root) = self.held.as_ref()?;
-        let now = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
-        let now = now.to_str()?;
-        if now.ends_with(" (deleted)") {
-            return Some(Err(Errno::ENOENT));
-        }
+        let now = match (crate::hostos::calls().fd_path)(file.as_raw_fd())? {
+            Ok(now) => now,
+            Err(e) => return Some(Err(e)),
+        };
         // Moved out of the mount: the path it was opened at is all there is.
-        let rel = Path::new(now).strip_prefix(root).ok()?;
+        let rel = now.strip_prefix(root).ok()?;
         // Any directory renamed here counts as this one moving: the host
         // keeps no count per directory.
         Some(Ok(super::Moved { was: was.clone(), now: rel.to_str()?.to_string(), epoch: self.gate.epoch() }))
@@ -460,7 +464,7 @@ impl FileSystem for HostFs {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
-        // Linux's O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK on the host.
+        // O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK as the host numbers them.
         let mut custom = 0;
         if flags & oflags::O_CREAT != 0 {
             // The guest's mode but never without owner rw: gex does not enforce
@@ -472,21 +476,21 @@ impl FileSystem for HostFs {
             } else {
                 // std refuses to create without write access; Linux creates
                 // with O_RDONLY (gnulib's open tests, `touch`-like opens)
-                custom |= 0o100;
+                custom |= host_o::CREAT;
             }
         }
         if flags & oflags::O_EXCL != 0 {
             if want_write {
                 opts.create_new(true);
             } else if flags & oflags::O_CREAT != 0 {
-                custom |= 0o200;
+                custom |= host_o::EXCL;
             }
         }
         if flags & oflags::O_TRUNC != 0 {
             if want_write {
                 opts.truncate(true);
             } else {
-                custom |= 0o1000;
+                custom |= host_o::TRUNC;
             }
         }
         if flags & oflags::O_APPEND != 0 {
@@ -494,9 +498,8 @@ impl FileSystem for HostFs {
         }
         // O_NONBLOCK reaches the host: opening a host FIFO without a writer
         // must not block (grep -D skip opens one so, to fstat and skip it).
-        // Linux's O_NONBLOCK on the host.
         if flags & oflags::O_NONBLOCK != 0 {
-            custom |= 0o4000;
+            custom |= host_o::NONBLOCK;
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
@@ -745,6 +748,23 @@ impl FileSystem for HostFs {
 
 use std::os::unix::fs::OpenOptionsExt;
 
+/// The host's open flags `OpenOptions` leaves to `custom_flags`: Linux's
+/// (asm-generic/fcntl.h) and XNU's (sys/fcntl.h).
+#[cfg(not(target_os = "macos"))]
+mod host_o {
+    pub const CREAT: i32 = 0o100;
+    pub const EXCL: i32 = 0o200;
+    pub const TRUNC: i32 = 0o1000;
+    pub const NONBLOCK: i32 = 0o4000;
+}
+#[cfg(target_os = "macos")]
+mod host_o {
+    pub const CREAT: i32 = 0x200;
+    pub const EXCL: i32 = 0x800;
+    pub const TRUNC: i32 = 0x400;
+    pub const NONBLOCK: i32 = 0x4;
+}
+
 /// Extended attributes on the host's files, `user.` only either way: a
 /// guest neither sets nor sees the host's other namespaces. The calls
 /// themselves are the host's ([`set_host_xattr`]: this crate has no unsafe
@@ -776,10 +796,10 @@ pub mod host_xattr {
     use crate::errno::Errno;
 
     /// The node: a host path (its final link not followed: the guest's walk
-    /// already followed it, or was asked not to) or an open descriptor.
+    /// already followed it, or was asked not to) or an open file.
     pub enum On<'a> {
         Path(&'a std::path::Path),
-        Fd(i32),
+        Fd(&'a std::fs::File),
     }
 
     /// The host's `l*xattr`/`f*xattr` calls, one [`XattrOp`] on `on`: what
@@ -799,14 +819,17 @@ pub mod host_xattr {
         match op {
             XattrOp::Get { name, buf } => {
                 xattr_name(name).map_err(not_user)?;
+                user_permission(&on, false)?;
                 calls(&on, XattrOp::Get { name, buf })
             }
             XattrOp::Set { name, value, flags } => {
                 xattr_name(name)?;
+                user_permission(&on, true)?;
                 calls(&on, XattrOp::Set { name, value, flags })
             }
             XattrOp::Remove { name } => {
                 xattr_name(name).map_err(not_user)?;
+                user_permission(&on, true)?;
                 calls(&on, XattrOp::Remove { name })
             }
             XattrOp::List { buf } => {
@@ -830,6 +853,28 @@ pub mod host_xattr {
                 Ok(mine.len())
             }
         }
+    }
+
+    /// Linux's `xattr_permission` for a `user.` name: only regular files
+    /// and directories carry one (a write elsewhere is `EPERM`, a read
+    /// `ENODATA`); in a sticky directory only its owner (or root) writes
+    /// one; and then the node's own permission, read or write. A Linux host
+    /// applies these itself; XNU applies none of them.
+    fn user_permission(on: &On<'_>, write: bool) -> Result<(), Errno> {
+        use std::os::unix::fs::MetadataExt;
+        let md = match on {
+            On::Path(p) => std::fs::symlink_metadata(p),
+            On::Fd(f) => f.metadata(),
+        }
+        .map_err(|e| Errno::from_io(&e))?;
+        if !md.is_file() && !md.is_dir() {
+            return Err(if write { Errno::EPERM } else { Errno::ENODATA });
+        }
+        let ids = super::host_ids();
+        if write && md.is_dir() && md.mode() & 0o1000 != 0 && ids.uid != 0 && md.uid() != ids.uid {
+            return Err(Errno::EPERM);
+        }
+        super::access_by(&md, if write { 2 } else { 4 })
     }
 }
 
@@ -872,10 +917,14 @@ mod tests {
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
     }
 
+    /// The directory [`emulated_no_links`] walks from: the one the walk
+    /// holds open as `root`.
+    static WALK_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
     /// The host's call as the native shim makes it, in safe code: a
     /// component at a time (what `openat2(RESOLVE_NO_SYMLINKS)` answers).
-    fn emulated_no_links(root: i32, rel: &str) -> bool {
-        let mut at = PathBuf::from(format!("/proc/self/fd/{root}"));
+    fn emulated_no_links(_root: i32, rel: &str) -> bool {
+        let mut at = WALK_ROOT.get().unwrap().clone();
         for c in rel.split('/').filter(|c| !c.is_empty()) {
             at.push(c);
             match std::fs::symlink_metadata(&at) {
@@ -903,6 +952,7 @@ mod tests {
         link("loop2", "loop1");
         link("loop1", "loop2");
         let fs = HostFs::new(&dir);
+        WALK_ROOT.set(dir.clone()).unwrap();
         host_walk::set_host_no_links(emulated_no_links);
         let paths = [
             "/a/b/c/f", "/l/c/f", "/l2/c/f", "/abs/b/c", "/a/b/up/l/c", "/a/b/up/a/b/up/abs/b", "/dangle",
@@ -922,13 +972,19 @@ mod tests {
 }
 
 /// `access(2)` against the host's permission bits, for this process's
-/// effective ids and groups (from `/proc/self/status`; no unsafe here, so
-/// not the host call itself). Root may read and write anything and execute
-/// what has an execute bit. ACLs and read-only mounts are not seen.
+/// effective ids and groups (the host's word, [`crate::hostos`]; no unsafe
+/// here, so not the host call itself). Root may read and write anything and
+/// execute what has an execute bit. ACLs and read-only mounts are not seen.
 #[cfg(unix)]
 fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
-    use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
+    access_by(&md, mode)
+}
+
+/// [`host_access`] for a node already looked at.
+#[cfg(unix)]
+fn access_by(md: &std::fs::Metadata, mode: u32) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
     let mode = mode & 7;
     if mode == 0 {
         return Ok(());
@@ -964,24 +1020,11 @@ struct HostIds {
 #[cfg(unix)]
 fn host_ids() -> &'static HostIds {
     static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
-    IDS.get_or_init(|| {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        // "Uid:\treal\teffective\tsaved\tfs"; the effective one decides.
-        let field = |name: &str| -> Vec<u32> {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(name))
-                .map(|r| r.split_whitespace().filter_map(|v| v.parse().ok()).collect())
-                .unwrap_or_default()
-        };
-        let uid = field("Uid:");
-        let gid = field("Gid:");
-        HostIds {
-            // Unknown ids (no /proc) count as nobody's, the cautious answer.
-            uid: uid.get(1).copied().unwrap_or(u32::MAX - 1),
-            gid: gid.get(1).copied().unwrap_or(u32::MAX - 1),
-            groups: field("Groups:"),
-        }
+    IDS.get_or_init(|| match (crate::hostos::calls().ids)() {
+        // the effective ids decide
+        Some(ids) => HostIds { uid: ids.euid, gid: ids.egid, groups: ids.groups },
+        // Unknown ids count as nobody's, the cautious answer.
+        None => HostIds { uid: u32::MAX - 1, gid: u32::MAX - 1, groups: Vec::new() },
     })
 }
 

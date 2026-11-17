@@ -18,6 +18,7 @@ mod prof;
 mod eject;
 mod pe_info;
 mod units;
+mod host_os;
 mod host_xattr;
 mod host_walk;
 
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode> {
+    host_os::install();
     host_xattr::install();
     host_walk::install();
     let argv: Vec<String> = std::env::args().collect();
