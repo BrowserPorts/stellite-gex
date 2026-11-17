@@ -23,11 +23,6 @@ pub trait Io {
     fn op(&mut self, op: u32, off: u64, buf: &mut [u8]) -> Result<(), Errno>;
 }
 
-/// The inode numbers the editor gives files: above any a kernel gives, so
-/// that a file written here is never taken for a hard link of one a run
-/// wrote (records name links by inode within a generation).
-const EDITOR_INO: u64 = 1 << 62;
-
 struct Store<I: Io> {
     io: I,
     bs: u64,
@@ -143,15 +138,9 @@ impl<I: Io> Editor<I> {
         let high = if l.found == Found::Fresh { 1 } else { l.journal.sb.high };
         s.alloc.rebuild(high, &l.used);
         s.alloc.defer_frees();
-        let next_ino = l
-            .recs
-            .values()
-            .filter_map(|r| match r {
-                Rec::File { ino, .. } if *ino >= EDITOR_INO => Some(ino + 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(EDITOR_INO);
+        // A file is one `ino` among the records as read (format::load numbers
+        // them afresh), shared by its hard links: a new file gets the next.
+        let next_ino = l.recs.values().filter_map(|r| if let Rec::File { ino, .. } = r { Some(ino + 1) } else { None }).max().unwrap_or(1);
         Ok(Editor { s, journal: l.journal, found: l.found, recs: l.recs, puts: BTreeSet::new(), drops: BTreeSet::new(), fresh: HashSet::new(), next_ino, inline })
     }
 
@@ -253,6 +242,24 @@ impl<I: Io> Editor<I> {
         self.puts.insert(k);
     }
 
+    /// The paths of the file `ino` (its hard links).
+    fn paths_of(&self, ino: u64) -> Vec<String> {
+        self.recs.iter().filter(|(_, r)| matches!(r, Rec::File { ino: i, .. } if *i == ino)).map(|(p, _)| p.clone()).collect()
+    }
+
+    /// A file's record put at `k` and at each other path of it: a hard
+    /// link is one file, changed at every path at once.
+    fn put_file(&mut self, k: String, r: Rec) {
+        if let Rec::File { ino, .. } = &r {
+            for p in self.paths_of(*ino) {
+                if p != k {
+                    self.put(p, r.clone());
+                }
+            }
+        }
+        self.put(k, r);
+    }
+
     fn drop_rec(&mut self, k: &str) {
         if let Some(Rec::File { body: Body::Blocks(_, map), ino, .. }) = self.recs.remove(k) {
             // A hard link's blocks stay while another path names its inode.
@@ -343,7 +350,7 @@ impl<I: Io> Editor<I> {
                 }
                 d[offset as usize..end as usize].copy_from_slice(data);
                 let body = Body::Inline(std::mem::take(d));
-                self.put(k, Rec::File { ino, mode, mtime, body, xattrs });
+                self.put_file(k, Rec::File { ino, mode, mtime, body, xattrs });
                 return Ok(());
             }
         }
@@ -358,7 +365,7 @@ impl<I: Io> Editor<I> {
         self.write_blocks(&mut map, offset, data, size)?;
         size = new_size;
         map.truncate(size.div_ceil(bs) as usize);
-        self.put(k, Rec::File { ino, mode, mtime, body: Body::Blocks(size, map), xattrs });
+        self.put_file(k, Rec::File { ino, mode, mtime, body: Body::Blocks(size, map), xattrs });
         Ok(())
     }
 
@@ -458,7 +465,7 @@ impl<I: Io> Editor<I> {
             Rec::File { mode: m, .. } | Rec::Dir { mode: m, .. } | Rec::Attrs { mode: m, .. } | Rec::Mode { mode: m } => *m = mode & 0o7777,
             _ => return Err(Errno::EINVAL),
         }
-        self.put(k, r);
+        self.put_file(k, r);
         Ok(())
     }
 
@@ -492,6 +499,17 @@ impl<I: Io> Editor<I> {
         if !self.dirty() && !checkpoint {
             return Ok(false);
         }
+        // A file's other paths go with it, so that the generation names
+        // them as one file.
+        let linked: Vec<String> = self
+            .puts
+            .iter()
+            .filter_map(|p| if let Some(Rec::File { ino, .. }) = self.recs.get(p) { Some(*ino) } else { None })
+            .collect::<HashSet<u64>>()
+            .into_iter()
+            .flat_map(|ino| self.paths_of(ino))
+            .collect();
+        self.puts.extend(linked);
         let gen = self.journal.next_gen();
         let seg = format::segment(gen, self.puts.iter().map(|p| (p.as_str(), self.recs[p].clone())), self.drops.iter().map(|p| p.as_str()));
         let fold = checkpoint || self.journal.fold(seg.len(), self.s.bs);
@@ -636,5 +654,58 @@ mod tests {
         assert_eq!(e.generation(), g1);
         assert_eq!(e.stat("/etc/gone").unwrap().kind, Kind::Gone);
         assert!(e.stat("/b").is_err());
+    }
+
+    /// Generations written as a run would write them: `gens` of records,
+    /// the first a checkpoint, files inline.
+    fn store_of(m: &mut Mem, gens: &[&[(&str, u64, &[u8])]]) {
+        let mut s = Store { io: m, bs: BS, alloc: Allocator::new() };
+        s.alloc.start();
+        s.alloc.defer_frees();
+        let mut j = Journal::default();
+        for (i, recs) in gens.iter().enumerate() {
+            let recs = recs.iter().map(|(p, ino, d)| (p.to_string(), Rec::File { ino: *ino, mode: 0o644, mtime: 0, body: Body::Inline(d.to_vec()), xattrs: Vec::new() }));
+            let payload = if i == 0 { format::checkpoint(j.next_gen(), recs) } else { format::segment(j.next_gen(), recs, []) };
+            j.write(&mut s, &payload, i == 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn two_generations_numbering_two_files_alike_are_two_files() {
+        let mut m = Mem::default();
+        // A boot's checkpoint, then a later boot's segment that gave a the
+        // number z had.
+        store_of(&mut m, &[&[("a", 5, b"aye"), ("z", 6, b"zed")], &[("a", 6, b"aye again")]]);
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/a"), b"aye again");
+        assert_eq!(read_all(&mut e, "/z"), b"zed");
+        // Not links of one another: a write to one leaves the other.
+        e.write("/a", 0, b"new", 0o644, 0, true).unwrap();
+        e.commit(false).unwrap();
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/a"), b"new");
+        assert_eq!(read_all(&mut e, "/z"), b"zed");
+    }
+
+    #[test]
+    fn a_hard_link_is_one_file_through_a_write_and_a_rename() {
+        let mut m = Mem::default();
+        store_of(&mut m, &[&[("m", 9, b"em"), ("m2", 9, b"em"), ("other", 10, b"other")]]);
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        e.write("/m2", 0, b"both", 0o644, 0, true).unwrap();
+        e.commit(false).unwrap();
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/m"), b"both");
+        // One path moved in a later generation: still one file with the other.
+        e.rename("/m", "/n").unwrap();
+        e.commit(false).unwrap();
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        e.write("/n", 0, &big(2 * BS as usize, 4), 0o600, 0, true).unwrap();
+        e.commit(false).unwrap();
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/m2"), big(2 * BS as usize, 4));
+        assert_eq!(e.stat("/m2").unwrap().mode, 0o600);
+        assert_eq!(read_all(&mut e, "/other"), b"other");
+        assert!(e.stat("/m").is_err());
     }
 }

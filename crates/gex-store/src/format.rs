@@ -24,7 +24,7 @@
 //! A record names a path without its leading `/`.
 
 use crate::{Errno, OP_FLUSH, OP_READ, OP_WRITE};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 const SB_MAGIC: &[u8; 8] = b"gexroot\x01";
 pub const SB_LEN: usize = 60;
@@ -417,14 +417,23 @@ fn read_chain(s: &mut impl Blocks, sb: &Sb) -> Result<(Vec<u8>, Vec<u32>), Errno
 
 /// The records a stream leaves: the checkpoint's, then each segment's. A
 /// tag or a record kind this build does not know is EIO, never skipped.
+///
+/// A file's `ino` names it among one generation's records only: each boot
+/// numbers its files afresh, so two generations' records may give one
+/// number to two files. Read back, a file is its generation and its number,
+/// renumbered here so that the records' `ino`s are one numbering again:
+/// paths a generation wrote as one file (hard links) share one, and no two
+/// files of different generations do.
 fn replay(stream: &[u8]) -> Result<BTreeMap<String, Rec>, Errno> {
     let mut r = R(stream, 0);
     let mut out = BTreeMap::new();
     let mut first = true;
+    let mut gen = 0u64;
+    let mut ids: HashMap<(u64, u64), u64> = HashMap::new();
     while r.1 < stream.len() {
         match r.u8()? {
             TAG_MARK => {
-                let _gen = r.u64()?;
+                gen = r.u64()?;
                 let ck = r.u8()?;
                 if first && ck != 1 {
                     return Err(Errno::EIO);
@@ -435,7 +444,11 @@ fn replay(stream: &[u8]) -> Result<BTreeMap<String, Rec>, Errno> {
             }
             TAG_PUT => {
                 let p = r.str()?;
-                let rec = r.rec()?;
+                let mut rec = r.rec()?;
+                if let Rec::File { ino, .. } = &mut rec {
+                    let next = ids.len() as u64 + 1;
+                    *ino = *ids.entry((gen, *ino)).or_insert(next);
+                }
                 out.insert(p, rec);
             }
             TAG_DROP => {

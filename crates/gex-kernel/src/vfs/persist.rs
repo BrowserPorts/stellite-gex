@@ -306,6 +306,21 @@ impl State {
             }
             sigs.insert(p.clone(), s);
         }
+        // A file's other paths (hard links) are written with it, so that the
+        // generation names them as one file: a link made to a file an
+        // earlier boot kept changes only its own path's signature.
+        let linked = links(&walked);
+        if !linked.is_empty() {
+            let mut more: Vec<&str> = Vec::new();
+            for p in &changed {
+                if let Some(paths) = linked.get(p) {
+                    more.extend(paths.iter().filter(|q| **q != *p && !changed.contains(q)));
+                }
+            }
+            more.sort_unstable();
+            more.dedup();
+            changed.extend(more);
+        }
         let dropped: Vec<&String> = self.committed.keys().filter(|p| !sigs.contains_key(*p)).collect();
         if changed.is_empty() && dropped.is_empty() {
             ST[S_EMPTY].fetch_add(1, Ordering::Relaxed);
@@ -338,6 +353,23 @@ impl State {
         self.since = None;
         Ok(())
     }
+}
+
+/// Each path of a file the walk found at more than one path: those paths.
+fn links(walked: &[(String, Pre)]) -> HashMap<&str, Vec<&str>> {
+    let mut by_node: HashMap<*const FileNode, Vec<&str>> = HashMap::new();
+    for (p, pre) in walked {
+        if let Pre::File { node, .. } = pre {
+            by_node.entry(Arc::as_ptr(node)).or_default().push(p.as_str());
+        }
+    }
+    let mut out = HashMap::new();
+    for paths in by_node.into_values().filter(|v| v.len() > 1) {
+        for &p in &paths {
+            out.insert(p, paths.clone());
+        }
+    }
+    out
 }
 
 /// A record's signature: whether it changed since the last generation,
@@ -876,6 +908,43 @@ mod tests {
         for i in 350..400 {
             assert_eq!(read(&fs, &format!("d/f{}", i % 50)).unwrap(), big(300, i as u8));
         }
+        reset();
+    }
+
+    /// Each boot numbers the files it lays and makes afresh, and a
+    /// generation's records name files by that boot's numbers. Records from
+    /// two boots that happen to share a number are two files at the next
+    /// boot, not one file and a hard link to it; a hard link made in a later
+    /// boot to a file an earlier one kept stays a hard link.
+    #[test]
+    #[ignore]
+    fn records_of_two_boots_are_never_taken_for_hard_links() {
+        STORE_FILE.lock().unwrap().clear();
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Fresh);
+        // Made in an order other than the paths': the next boot, which lays
+        // them in path order, numbers them the other way round.
+        write(&fs, "z", b"zed");
+        write(&fs, "a", b"aye");
+        write(&fs, "m", b"em");
+        sync().unwrap();
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        // Only a and the new link to m change: their records are this
+        // boot's, beside z's and m's of the boot before.
+        write(&fs, "a", b"aye again");
+        fs.link("m", "m2").unwrap();
+        sync().unwrap();
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(read(&fs, "a").unwrap(), b"aye again");
+        assert_eq!(read(&fs, "z").unwrap(), b"zed");
+        assert_eq!(read(&fs, "m").unwrap(), b"em");
+        // m and m2 are one file.
+        write(&fs, "m2", b"both");
+        assert_eq!(read(&fs, "m").unwrap(), b"both");
         reset();
     }
 }
