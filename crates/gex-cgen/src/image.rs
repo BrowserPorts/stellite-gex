@@ -771,7 +771,7 @@ pub fn build_group_module(
 ) -> Result<ImageStats> {
     let mut rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
-    let (big, callers) = leave_oversized(&mut rec, recoveries, stubs)?;
+    let (big, callers, leaves) = scan_recoveries(&mut rec, recoveries, stubs, read)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
@@ -782,7 +782,7 @@ pub fn build_group_module(
     loop {
         // A unit clang ran out of memory on: its largest function goes to
         // tier-1 (its lifted twin is dropped), and the units build again.
-        let stats = match emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers) {
+        let stats = match emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers, &leaves) {
             Err(e) if e.downcast_ref::<UnitOutOfMemory>().is_some() => {
                 let o = e.downcast::<UnitOutOfMemory>().expect("checked");
                 eprintln!(
@@ -849,13 +849,32 @@ pub fn build_group_module(
 /// Callee -> its trap-free direct callers.
 type TrapfreeCallers = HashMap<u64, Vec<u64>>;
 
-/// The functions of `recoveries` over [`max_insns`], which become stubs
-/// that leave for tier-1 (said in the build log), and the trap-free callers
-/// of every function, for [`untrap`]. Not an export provider's stub
-/// (`stubs`), which is one already.
-fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64>) -> Result<(Vec<u64>, TrapfreeCallers)> {
+/// A small leaf every unit may copy ([`func::is_small_copyable`],
+/// `FnUnit::leaves`), with how its returns pop and its ZF-returning calls,
+/// as [`emit_and_link`] gives them to the units.
+struct Leaf {
+    f: Function,
+    pops: HashMap<u64, u64>,
+    zf: HashSet<u64>,
+}
+
+/// One pass over `recoveries`' functions before any is emitted: those over
+/// [`max_insns`], which become stubs that leave for tier-1 (said in the
+/// build log; not an export provider's stub, `stubs`, which is one already),
+/// the trap-free callers of every function, for [`untrap`], and the small
+/// leaves (when [`func::leaf_copies`]), in the recoveries' order. Every
+/// attempt at the units takes the leaves from here, so it reads the
+/// recoveries once more rather than twice.
+fn scan_recoveries(
+    rec: &mut Recovery,
+    recoveries: &[&Path],
+    stubs: &HashSet<u64>,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+) -> Result<(Vec<u64>, TrapfreeCallers, Vec<Leaf>)> {
     let mut big = Vec::new();
     let mut callers: TrapfreeCallers = HashMap::new();
+    let mut leaves = Vec::new();
+    let copies = func::leaf_copies();
     for recovery in recoveries {
         let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
@@ -869,13 +888,18 @@ fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64
                     }
                 }
             }
+            if copies && func::is_small_copyable(&f) {
+                let pops = func::ret_pops(std::slice::from_ref(&f), rec.class32, read);
+                let zf = func::zf_calls(std::slice::from_ref(&f), read);
+                leaves.push(Leaf { f, pops, zf });
+            }
         }
     }
     say_oversized(&big);
     for &(a, _) in &big {
         untrap(rec, &callers, a);
     }
-    Ok((big.into_iter().map(|(a, _)| a).collect(), callers))
+    Ok((big.into_iter().map(|(a, _)| a).collect(), callers, leaves))
 }
 
 /// `a` becomes a stub that leaves for tier-1, which must not be trap-free:
@@ -923,24 +947,19 @@ fn emit_and_link(
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
     hints: &std::sync::Arc<HashMap<u64, u64>>,
     providers: &GroupProviders,
+    scanned: &[Leaf],
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
     // The small leaves every unit may copy (`FnUnit::leaves`), and how
-    // their returns pop. A stub's body is not its function's: no copy.
+    // their returns pop, from [`scan_recoveries`]. A stub's body is not its
+    // function's: no copy.
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
     let mut leaf_zf = std::collections::HashSet::new();
-    if func::leaf_copies() {
-        for recovery in recoveries {
-            let mut gir = GirReader::open(recovery)?;
-            while let Some(f) = gir.next()? {
-                if !skip.contains(&f.entry) && func::is_small_copyable(&f) {
-                    leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
-                    leaf_zf.extend(func::zf_calls(std::slice::from_ref(&f), read));
-                    leaves.insert(f.entry, f);
-                }
-            }
-        }
+    for l in scanned.iter().filter(|l| !skip.contains(&l.f.entry)) {
+        leaf_pops.extend(l.pops.iter().map(|(&k, &v)| (k, v)));
+        leaf_zf.extend(l.zf.iter().copied());
+        leaves.insert(l.f.entry, l.f.clone());
     }
     let leaves = std::sync::Arc::new(leaves);
     let new_unit = || {
