@@ -17,8 +17,8 @@ use crate::emit::{self, reg_name, Emitter, FnRegs};
 use anyhow::{bail, Result};
 use gex_abi::ctx;
 use gex_ir::func::{BlockId, Callee, Edge, FBlock, FTerm, Form, Function, RegSet, Summary};
-use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt, Ty, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 
@@ -797,6 +797,9 @@ impl FnUnit {
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
+        let (split, split_values) = xmm_split(f);
+        regs.split = split;
+        regs.split_values = split_values;
         self.live = if live_writebacks() { live_in_with(f, sums, &self.zf_calls) } else { vec![RegSet::ALL; f.blocks.len()] };
         self.carry = if regs.clean_spills { self.carried(f, known, sums, trapfree) } else { HashMap::new() };
         let dirty = if regs.clean_spills { dirty_in(f, &self.carry) } else { Vec::new() };
@@ -817,6 +820,9 @@ impl FnUnit {
         let _ = writeln!(fhead, "{force}{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
             let _ = writeln!(fhead, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
+        }
+        for (r, w) in &e.func_regs.as_ref().expect("set above").split {
+            let _ = writeln!(fhead, "  {} {}_s;", if *w == 8 { "uint64_t" } else { "uint32_t" }, reg_name(*r));
         }
         let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
         // Set when a poll expires anywhere: the next outermost back-edge
@@ -878,6 +884,10 @@ impl FnUnit {
             let in_loop = |i: usize| lp.body.contains(&i);
             let mut lregs = registers_in(f, &in_loop);
             lregs.clean_spills = clean_spills();
+            if let Some(fr) = &e.func_regs {
+                lregs.split = fr.split.iter().filter(|(r, _)| lregs.used.contains(r)).map(|(r, w)| (*r, *w)).collect();
+                lregs.split_values = fr.split_values.clone();
+            }
             let lused: Vec<GuestReg> = lregs.used.iter().copied().collect();
             let ldirty = if lregs.clean_spills {
                 dirty_in_from(f, lp.header, &in_loop, &self.carry)
@@ -892,6 +902,9 @@ impl FnUnit {
             );
             for r in &lused {
                 let _ = writeln!(head, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
+            }
+            for (r, w) in &le.func_regs.as_ref().expect("set above").split {
+                let _ = writeln!(head, "  {} {}_s;", if *w == 8 { "uint64_t" } else { "uint32_t" }, reg_name(*r));
             }
             let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
             let _ = writeln!(head, "  int hot = 0; (void)hot;");
@@ -1894,7 +1907,126 @@ pub fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
         used,
         written,
         clean_spills: false,
+        split: BTreeMap::new(),
+        split_values: HashSet::new(),
     }
+}
+
+/// The vector registers `f` uses through lane 0 (scalar SSE), to be kept as
+/// a scalar local beside the rest of the register (`FnRegs::split`), and the
+/// values in that form (`FnRegs::split_values`).
+///
+/// A register is split when it has a read used only through lane 0 at one
+/// width (4 or 8 bytes): extracted, or the base of a lane-0 replacement that
+/// is written back to the same register and nowhere else, which stays in
+/// split form. Its reads used any other way are joined, which is allowed only
+/// outside loops (a zero idiom before one, say); inside a loop that would add
+/// lane operations to packed code, and the register stays whole. Any write
+/// is taken: a split value sets both locals, any other its lane 0 extracted.
+/// Each scalar operation is then the arithmetic on lane 0 alone, where a
+/// whole register is an extract, the operation and a replace; a loop's
+/// write-backs (its poll, its exits) join the halves, on their own paths.
+/// `GEX_CGEN_EXP=NOXMMSPLIT` turns it off (pricing; not in the unit key).
+pub fn xmm_split(f: &Function) -> (BTreeMap<GuestReg, u8>, HashSet<Value>) {
+    let mut regs = BTreeMap::new();
+    let mut values = HashSet::new();
+    if !gex_abi::X86 || exp("NOXMMSPLIT") {
+        return (regs, values);
+    }
+    let mut in_loop = vec![false; f.blocks.len()];
+    for lp in outer_loops(f) {
+        for &i in &lp.body {
+            in_loop[i] = true;
+        }
+    }
+    // Every definition, and every use of each value: by which statement.
+    #[derive(Clone, Copy)]
+    enum Use {
+        Def(Value),
+        Write(GuestReg),
+        Other,
+    }
+    let mut def: HashMap<Value, (usize, &Expr)> = HashMap::new();
+    let mut uses: HashMap<Value, Vec<Use>> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for st in &b.stmts {
+            match st {
+                Stmt::Def { dst, expr } => {
+                    def.insert(*dst, (bi, expr));
+                    expr.for_each_use(|v| uses.entry(v).or_default().push(Use::Def(*dst)));
+                }
+                Stmt::WriteReg { reg, val } => uses.entry(*val).or_default().push(Use::Write(*reg)),
+                _ => st.for_each_use(|v| uses.entry(v).or_default().push(Use::Other)),
+            }
+        }
+        b.term.for_each_use(|v| uses.entry(v).or_default().push(Use::Other));
+        for e in b.term.edges() {
+            for &v in &e.args {
+                uses.entry(v).or_default().push(Use::Other);
+            }
+        }
+    }
+    // For a read of `r`, the width of its lane-0 uses when all its uses are
+    // those (with each replacement written to `r` only), and the
+    // replacements: `None` when it is used any other way.
+    let lane0_uses = |v: Value, r: GuestReg| -> Option<(Option<u8>, Vec<Value>)> {
+        let mut w = None;
+        let mut reps = Vec::new();
+        for u in uses.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+            let Use::Def(d) = u else { return None };
+            let k = match def.get(d)?.1 {
+                Expr::VExtract { a, lane: 0, lane_bytes: k @ (4 | 8), .. } if *a == v => *k as u8,
+                Expr::VReplace { a, lane: 0, lane_bytes: k @ (4 | 8), val } if *a == v && *val != v => {
+                    if !matches!(uses.get(d).map(|u| u.as_slice()), Some([Use::Write(t)]) if *t == r) {
+                        return None;
+                    }
+                    reps.push(*d);
+                    *k as u8
+                }
+                _ => return None,
+            };
+            if w.is_some_and(|w| w != k) {
+                return None;
+            }
+            w = Some(k);
+        }
+        Some((w, reps))
+    };
+    // Per register: its width, whether a read is lane-0 only, and whether a
+    // read used whole sits in a loop.
+    let mut seen: BTreeMap<GuestReg, (Option<u8>, bool, bool, Vec<Value>)> = BTreeMap::new();
+    let mut ok: BTreeMap<GuestReg, bool> = BTreeMap::new();
+    for (&v, &(bi, expr)) in &def {
+        let Expr::ReadReg(r) = expr else { continue };
+        if r.ty() != Ty::V128 {
+            continue;
+        }
+        let e = seen.entry(*r).or_insert((None, false, false, Vec::new()));
+        let good = ok.entry(*r).or_insert(true);
+        match lane0_uses(v, *r) {
+            Some((Some(k), reps)) => {
+                if e.0.is_some_and(|w| w != k) {
+                    *good = false;
+                }
+                e.0 = Some(k);
+                e.1 = true;
+                e.3.push(v);
+                e.3.extend(reps);
+            }
+            _ => {
+                if in_loop[bi] {
+                    *good = false;
+                }
+            }
+        }
+    }
+    for (r, (w, scalar, _, vals)) in seen {
+        if let (Some(w), true, true) = (w, scalar, ok[&r]) {
+            regs.insert(r, w);
+            values.extend(vals);
+        }
+    }
+    (regs, values)
 }
 
 /// Clean-spill elision is on
@@ -2124,7 +2256,7 @@ fn drop_unused_defs(f: &mut Function) -> bool {
     let mut any = false;
     loop {
         let mut used = vec![false; f.n_values as usize];
-        let mut mark = |v: gex_ir::Value| {
+        let mut mark = |v: Value| {
             if let Some(u) = used.get_mut(v.0 as usize) {
                 *u = true;
             }
@@ -2140,7 +2272,7 @@ fn drop_unused_defs(f: &mut Function) -> bool {
                 }
             }
         }
-        let unused = |v: &gex_ir::Value| !used.get(v.0 as usize).copied().unwrap_or(true);
+        let unused = |v: &Value| !used.get(v.0 as usize).copied().unwrap_or(true);
         let mut changed = false;
         for b in f.blocks.iter_mut() {
             let drop: Vec<bool> = b
