@@ -172,9 +172,28 @@ fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
 /// The key of `image`'s unit built around `pv`'s providers and its
 /// indirect-call profile (`icall_hints`): the image's own key when there
 /// are neither.
+/// The functions the next units built in this process compile, when not
+/// all of them ([`set_functions`]).
+static FUNCTIONS: Mutex<Option<std::collections::BTreeSet<u64>>> = Mutex::new(None);
+
+/// Compile only `functions` into the units built from here on (`gexc
+/// cgen-image --functions`, a hot set from `gexc hotset`): the image's other
+/// functions leave for tier-1 (`gex_cgen::image::build_c_module_only`).
+/// The set, not where it came from, is part of the unit's key, so units of
+/// different sets of one image never stand in for each other. `None`: every
+/// function, as before.
+pub fn set_functions(functions: Option<std::collections::BTreeSet<u64>>) {
+    *FUNCTIONS.lock().unwrap() = functions;
+}
+
 fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
     use std::hash::{Hash, Hasher};
     let mut key = image_key(image);
+    if let Some(only) = FUNCTIONS.lock().unwrap().as_ref() {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        only.hash(&mut h);
+        key = format!("{key}-s{:016x}", h.finish());
+    }
     if !pv.stubs.is_empty() {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         pv.stubs.hash(&mut h);
@@ -889,7 +908,8 @@ fn prepare_with(
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().chain(&pv.twins).copied().collect();
     let hints = icall_hints(image);
-    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
+    let only: Option<std::collections::HashSet<u64>> = FUNCTIONS.lock().unwrap().as_ref().map(|s| s.iter().copied().collect());
+    let stats = gex_cgen::image::build_c_module_only(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, only.as_ref())?;
     // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
     if std::env::var_os("GEX_CGEN_KEEP").is_none() {
         let _ = std::fs::remove_dir_all(&work);
