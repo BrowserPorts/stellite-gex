@@ -43,7 +43,10 @@
 #    linked into target/web-debug/<flavour>/ for symbolizing. vite then
 #    builds the flavour's dist from that tree.
 #
-# $CACHE is GEX_WEB_BUILD, by default target/web-build.
+# $CACHE is GEX_WEB_BUILD, by default target/web-build. The packages
+# toolchain/debian-package.sh unpacks stay in the caller's store
+# (GEX_PACKAGE_CACHE, or the caller's CACHE): that store is case-sensitive,
+# and the build folder need not be.
 #
 # To serve both at once:
 #
@@ -53,6 +56,7 @@
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+export GEX_PACKAGE_CACHE="${GEX_PACKAGE_CACHE:-${CACHE:-$HOME/.cache/gex}}"
 CACHE="${GEX_WEB_BUILD:-$ROOT/target/web-build}"
 DEBUGDIR="$ROOT/target/web-debug"
 MP=1 SP=0 ASSETS=1 GL=1 X=1 DEBUG=0 DISTS=1
