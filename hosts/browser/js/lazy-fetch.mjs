@@ -20,14 +20,21 @@ export function setFill(f) {
   if (!f?.buf || !f?.at || !f?.files) return;
   fill = { buf: new Uint8Array(f.buf), at: f.at, files: new Map(f.files.map(([path, off, size]) => [path, [off, size]])) };
 }
-// Wait until the fill holds `end` bytes; false if it failed or stalled.
-function fillHas(end) {
-  for (;;) {
-    const at = Atomics.load(fill.at, 0);
-    if (at < 0) return false;
-    if (at >= end) return true;
-    // Workers may block; the page's thread never reads lazy files.
-    if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return false;
+// Wait until the fill holds `end` bytes; false if it failed or stalled. A
+// wait is noted (`what`, the file it is for), as a fetch is.
+function fillHas(end, what) {
+  let done = null;
+  try {
+    for (;;) {
+      const at = Atomics.load(fill.at, 0);
+      if (at < 0) return false;
+      if (at >= end) return true;
+      done ??= noteFetch(`fill:${what}`, end - at);
+      // Workers may block; the page's thread never reads lazy files.
+      if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return false;
+    }
+  } finally {
+    done?.();
   }
 }
 /** A fill entry that is not a lazy file (`unit:KEY/c.wasm`, a late unit's
@@ -35,7 +42,7 @@ function fillHas(end) {
  *  or null when the fill has no such entry. */
 export function fillFile(name) {
   const f = fill?.files.get(name);
-  if (!f || !fillHas(f[0] + f[1])) return null;
+  if (!f || !fillHas(f[0] + f[1], name)) return null;
   return fill.buf.slice(f[0], f[0] + f[1]);
 }
 function fromFill(href, from, memory, dst, len) {
@@ -45,7 +52,7 @@ function fromFill(href, from, memory, dst, len) {
   const f = fill.files.get(path);
   if (!f || from + len > f[1]) return -1;
   const end = f[0] + from + len;
-  if (!fillHas(end)) return -1;
+  if (!fillHas(end, path)) return -1;
   new Uint8Array(memory.buffer, dst, len).set(fill.buf.subarray(f[0] + from, end));
   return len;
 }

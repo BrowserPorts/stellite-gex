@@ -9,7 +9,19 @@
 // -mms-bitfields and -fshort-wchar. A layout test checks the result.
 //
 //   clang --target=wasm64-unknown-unknown -fplugin=GexLLP64.so -include llp64.h ...
+//
+// It also gives dllexport and dllimport their PE meaning on a target that
+// drops them: a declaration marked with either has default visibility, so a
+// DLL exports what MinGW code marks dllexport and refers to what it marks
+// dllimport by name (clang's wasm default visibility is hidden, like a PE
+// symbol nobody exports). The wasm target knows no dllexport attribute, so
+// gexcc-win renames the two (-Ddllexport=__gexw_dllexport,
+// -Ddllimport=__gexw_dllimport) to this plugin's attributes, in both
+// __declspec(...) and __attribute__((...)) spellings.
 #include "clang/AST/ASTConsumer.h"
+#include "clang/AST/Attr.h"
+#include "clang/Sema/ParsedAttr.h"
+#include "clang/Sema/Sema.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
@@ -52,6 +64,25 @@ struct Action : PluginASTAction {
   ActionType getActionType() override { return AddBeforeMainAction; }
 };
 
+struct DllAttr : ParsedAttrInfo {
+  DllAttr() {
+    static constexpr Spelling S[] = {{ParsedAttr::AS_Declspec, "__gexw_dllexport"},
+                                     {ParsedAttr::AS_GNU, "__gexw_dllexport"},
+                                     {ParsedAttr::AS_Declspec, "__gexw_dllimport"},
+                                     {ParsedAttr::AS_GNU, "__gexw_dllimport"}};
+    Spellings = S;
+  }
+  bool diagAppertainsToDecl(Sema &, const ParsedAttr &, const Decl *D) const override {
+    return isa<FunctionDecl>(D) || isa<VarDecl>(D) || isa<CXXRecordDecl>(D);
+  }
+  AttrHandling handleDeclAttribute(Sema &S, Decl *D, const ParsedAttr &) const override {
+    if (!D->hasAttr<VisibilityAttr>())
+      D->addAttr(VisibilityAttr::CreateImplicit(S.Context, VisibilityAttr::Default));
+    return AttributeApplied;
+  }
+};
+
 } // namespace
 
+static ParsedAttrInfoRegistry::Add<DllAttr> Y("gexw-dll", "dllexport and dllimport as default visibility");
 static FrontendPluginRegistry::Add<Action> X("gex-llp64", "Windows x64 data model (LLP64) on wasm64");

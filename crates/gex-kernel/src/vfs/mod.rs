@@ -515,6 +515,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_inotify(self: Arc<Self>) -> Option<Arc<crate::inotify::Inotify>> {
         None
     }
+    /// This handle as itself, for a filesystem that recognises its own
+    /// handles ([`FileHandle::share_from`]).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+    /// This (empty) file made a copy of all of `src` that shares its bytes
+    /// until either is written, where the filesystem can: the size copied.
+    /// `None` where it cannot (another filesystem, a file whose bytes are
+    /// not all here); the caller copies them itself.
+    fn share_from(&self, _src: &dyn FileHandle) -> Option<SysResult> {
+        None
+    }
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }

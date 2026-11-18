@@ -451,26 +451,25 @@ impl ProcFs {
                 // A fixed 4 GiB total: the browser does not say how much
                 // the machine has. In use: what the processes have mapped
                 // and accessible, summed.
+                // Shmem: what the kernel's file system holds in memory, as
+                // Linux counts tmpfs's pages there.
                 Some(sys) => {
                     let free = (4u64 << 30).saturating_sub(sys.rss) >> 10;
+                    let shmem = super::tmpfs::TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed) >> 10;
                     format!(
                         "MemTotal:        4194304 kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
                          Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
-                         SwapFree:              0 kB\n"
+                         SwapFree:              0 kB\nShmem:          {shmem:8} kB\n"
                     )
                     .into_bytes()
                 }
-                None => concat!(
-                    "MemTotal:        4194304 kB\n",
-                    "MemFree:         2097152 kB\n",
-                    "MemAvailable:    3145728 kB\n",
-                    "Buffers:               0 kB\n",
-                    "Cached:                0 kB\n",
-                    "SwapTotal:             0 kB\n",
-                    "SwapFree:              0 kB\n",
+                None => format!(
+                    "MemTotal:        4194304 kB\nMemFree:         2097152 kB\nMemAvailable:    3145728 kB\n\
+                     Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
+                     SwapFree:              0 kB\nShmem:          {:8} kB\n",
+                    super::tmpfs::TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed) >> 10
                 )
-                .as_bytes()
-                .to_vec(),
+                .into_bytes(),
             },
             "cpuinfo" if gex_abi::X86 => crate::cpus::proc_cpuinfo(crate::x86::CPUINFO).into_bytes(),
             "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(

@@ -935,6 +935,15 @@ struct Outgrow {
     /// gex's own memory for it ran out in the lowered memory
     /// ([`note_runtime_short`]): it ends for that, whatever its status.
     runtime: bool,
+    /// Whether Wine's core module has a memory64 build beside it, once it
+    /// is loaded, and the first other module that has none
+    /// ([`outgrow_module`]): with both, a 64-bit memory cannot run the
+    /// process, so it is never recorded for one.
+    core_m64: Option<bool>,
+    no64: Option<String>,
+    /// It was recorded for a 64-bit memory and starts itself again in one
+    /// ([`outgrow_restart`]): its end is no crash.
+    restarted: bool,
 }
 
 static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
@@ -946,10 +955,14 @@ fn raw_ns(clock: ClockFn) -> u64 {
 
 /// The Windows program Wine's loader (`path`) was started on by hand
 /// (`wine C:\\app.exe`, not by CreateProcess, which says it in
-/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path, found
-/// through the prefix's dosdevices. `None` for any other program.
+/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path found
+/// through the prefix's dosdevices, or a Unix path as it is. `None` for any other program.
 pub fn wine_program(path: &str, argv: &[String], envp: &[String]) -> Option<String> {
     let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+    // (or a Unix path, which Wine's loader takes as it is)
+    if let Some(a) = argv.get(1).filter(|a| wine && a.starts_with('/') && a.len() > 4 && a[a.len() - 4..].eq_ignore_ascii_case(".exe")) {
+        return Some(a.clone());
+    }
     let a = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\')?;
     let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
     Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))
@@ -994,6 +1007,32 @@ pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) -> bool {
     end
 }
 
+/// Process `pid`, which [`note_short`] is ending, can start itself again
+/// (64-bit Wine's `PR_GEX_SHORT` with a third argument of 1: it starts its
+/// own program again, with its command line, environment and directory,
+/// and then exits): record its program for a 64-bit memory now, before
+/// that start looks, and say whether it should. False, and it is ended
+/// as before, when it cannot move (a module with no memory64 build, a host
+/// with no 64-bit memory, no program known, or the record failed).
+fn outgrow_restart(pid: i32) -> bool {
+    let Some(host) = OUTGROW_HOST.get() else { return false };
+    if !(host.reachable)() {
+        return false;
+    }
+    let mut all = OUTGROW.lock();
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid) else { return false };
+    if o.core_m64 == Some(true) && o.no64.is_some() {
+        return false;
+    }
+    let Some(p) = o.image.clone() else { return false };
+    let set = o.ns.get().xattr(&p, true, crate::vfs::XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 });
+    if set.is_err() {
+        return false;
+    }
+    o.restarted = true;
+    true
+}
+
 /// Whether a [`crate::proc::PR_GEX_SHORT`] process `pid` just made says to
 /// end it ([`note_short`]), for its caller: `prctl` is answered where no
 /// signal can be raised.
@@ -1020,6 +1059,30 @@ pub fn note_runtime_short(pid: i32, len: u64, wasm32: bool) -> bool {
     }
     o.runtime = true;
     true
+}
+
+/// Process `pid` loaded native module `file` (a skeleton's), with a
+/// memory64 build beside it (`<file>.m64`) or not (`m64`). Wine's core
+/// (`winepe.wasm`) with one says the install has a 64-bit memory to move
+/// to; any other module without one then cannot move with it (a program's
+/// own, built for a wasm32 memory only), so outgrowing the lowered memory
+/// ends the process for good, saying so, and never records it for one
+/// ([`outgrow_ending`]). The first such module is the one named. Takes no
+/// other lock.
+pub fn outgrow_module(pid: i32, file: &str, m64: bool) {
+    if gex_abi::mem64() {
+        return;
+    }
+    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == pid) {
+        // (a WoW64 process loads a second Wine core, its 32-bit side's,
+        // which an install's memory64 twin has no build of either: that
+        // core is then the module that cannot move)
+        if file.rsplit('/').next() == Some("winepe.wasm") && o.core_m64.is_none() {
+            o.core_m64 = Some(m64);
+        } else if !m64 {
+            o.no64.get_or_insert_with(|| file.to_string());
+        }
+    }
 }
 
 /// Whether [`note_runtime_short`] would record process `pid`, and its host
@@ -1051,6 +1114,14 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
         all.swap_remove(i)
     };
     let Some((len, at)) = rec.short else { return };
+    if rec.restarted {
+        (host.say)(&format!(
+            "{} needs 64-bit memory (a reservation of {:#x} bytes did not fit); started again in one\n",
+            rec.image.as_deref().unwrap_or(""),
+            rec.last.max(len)
+        ));
+        return;
+    }
     let sig = (status & 0x7f) as u32;
     let abnormal = rec.ended
         || rec.runtime
@@ -1063,7 +1134,19 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
         let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
         procs.set_crash_unless_said(pid, why.as_bytes());
     }
-    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS || !(host.reachable)() {
+    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS {
+        return;
+    }
+    // a module with no memory64 build: a 64-bit memory would not run it
+    if let (Some(true), Some(m)) = (rec.core_m64, &rec.no64) {
+        (host.say)(&format!(
+            "{} ran out of memory (2 GiB); {m} has no 64-bit memory build ({m}.m64), so it cannot move to a 64-bit memory\n",
+            rec.image.as_deref().unwrap_or("")
+        ));
+        procs.add_crash_line(pid, "ran out of memory (2 GiB); this program has no 64-bit memory build");
+        return;
+    }
+    if !(host.reachable)() {
         return;
     }
     let set = match &rec.image {
@@ -1781,6 +1864,35 @@ impl FdIo<'_> {
         }
         Ok(sent)
     }
+    /// A `copy_file_range` of all of a file, from its start, into an empty
+    /// one at its start, as the filesystem's own copy that shares the bytes
+    /// until either file is written ([`crate::vfs::FileHandle::share_from`]),
+    /// each descriptor's position moved on as a copy's would be. `None`
+    /// where that is not this copy or the filesystem cannot.
+    fn share_whole(&self, in_fd: i32, in_off: Option<u64>, out_fd: i32, out_off: Option<u64>, len: u64) -> Result<Option<u64>, Errno> {
+        let in_file = self.fds.get(in_fd)?;
+        let out_file = self.fds.get(out_fd)?;
+        if !in_file.readable || !out_file.writable || out_file.flags() & crate::fs::oflags::O_APPEND != 0 {
+            return Ok(None);
+        }
+        let at = |f: &OpenFile, o: Option<u64>| o.map_or_else(|| f.seek(0, 1 /* SEEK_CUR */).ok(), Some);
+        if at(&in_file, in_off) != Some(0) || at(&out_file, out_off) != Some(0) {
+            return Ok(None);
+        }
+        let (Ok(src), Ok(dst)) = (in_file.handle.metadata(), out_file.handle.metadata()) else { return Ok(None) };
+        if dst.size != 0 || len < src.size || src.size == 0 {
+            return Ok(None);
+        }
+        let Some(r) = out_file.handle.share_from(&*in_file.handle) else { return Ok(None) };
+        let n = r?;
+        if in_off.is_none() {
+            in_file.seek(n as i64, 0 /* SEEK_SET */)?;
+        }
+        if out_off.is_none() {
+            out_file.seek(n as i64, 0 /* SEEK_SET */)?;
+        }
+        Ok(Some(n))
+    }
     /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
     /// Both offset pointers are optional; each non-null one is used for the
     /// transfer and then advanced by the bytes copied. `flags` is reserved and
@@ -1808,7 +1920,10 @@ impl FdIo<'_> {
         } else {
             None
         };
-        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
+        let copied = match self.share_whole(fd_in, in_off, fd_out, out_off, len)? {
+            Some(n) => n,
+            None => self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?,
+        };
         if let Some(o) = in_off {
             m.write_u64(off_in, o + copied)?;
         }
@@ -7249,15 +7364,38 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 procs.set_crash(io.pid, &note);
                 Ok(0)
             }
-            // A reservation the lowered memory had no room for, as 64-bit
-            // Wine says it (it never asks for a mapping it found no gap for).
-            crate::proc::PR_GEX_SHORT => {
-                if note_short(io.pid, a[1], io.compat, false) {
-                    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == io.pid) {
-                        o.end = true;
+            // Why the process cannot work as it should, while it runs (a
+            // need no memory gex has can meet): a notice, once.
+            crate::proc::PR_GEX_NOTICE => {
+                let text = m.read(a[1], (a[2] as usize).min(512))?.to_vec();
+                let text = String::from_utf8_lossy(&text);
+                procs.notice(io.pid, &text);
+                // said where it is made by a host that does not say it
+                // from the table (the page's shim: its console, which has
+                // no reader of the table but the page's own)
+                if !crate::proc::crash_hook_set() {
+                    if let Some(h) = OUTGROW_HOST.get() {
+                        (h.say)(&format!("pid {}: {}\n", io.pid, text.trim_end()));
                     }
                 }
                 Ok(0)
+            }
+            // A reservation the lowered memory had no room for, as 64-bit
+            // Wine says it (it never asks for a mapping it found no gap for).
+            // With a third argument of 1, the caller can start itself again
+            // in a 64-bit memory: 1 says to ([`outgrow_restart`]), instead
+            // of its end.
+            crate::proc::PR_GEX_SHORT => {
+                if !note_short(io.pid, a[1], io.compat, false) {
+                    Ok(0)
+                } else if a[2] == 1 && outgrow_restart(io.pid) {
+                    Ok(1)
+                } else {
+                    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == io.pid) {
+                        o.end = true;
+                    }
+                    Ok(0)
+                }
             }
             _ => Ok(0),
         },
@@ -10159,16 +10297,20 @@ impl Kernel {
             .clone()
             .or_else(|| (!exec).then(|| wine_program(path, &self.argv, &self.envp)).flatten())
             .or_else(|| (!path.is_empty() && !loader(path)).then(|| path.to_string()));
-        let stay32 = self.exec_mem64 == Some(false);
+        // A 32-bit Windows program (a PE32 image, in a WoW64 process) has
+        // no 64-bit memory to move to: the i386 builtins have no memory64
+        // modules. It keeps the lowered memory, as if it asked to.
+        let stay32 = self.exec_mem64 == Some(false)
+            || image.as_deref().and_then(|p| self.read_head(p, 4096)).is_some_and(|h| pe_is_32bit(&h));
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
-            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None, restarted: false },
             Some(o) => {
                 if o.image.is_none() {
                     o.image = image;
                 }
             }
-            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false }),
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None, restarted: false }),
         }
     }
 
@@ -13089,9 +13231,11 @@ impl Kernel {
 }
 
 /// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
-/// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
-/// always does: glibc's `statvfs` otherwise looks the mount flags up in
-/// /proc/mounts.
+/// magic, a 256 GiB volume with 192 GiB free). Installers refuse to start
+/// when the free space is below what they will lay down, and large ones
+/// ask for several GiB; a write past what the host can hold still fails
+/// at the write. `f_flags` has ST_VALID, as Linux's always does: glibc's
+/// `statvfs` otherwise looks the mount flags up in /proc/mounts.
 pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
@@ -13102,9 +13246,9 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     };
     put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
     put(&mut out, 8, 4096); // f_bsize
-    put(&mut out, 16, 1 << 20); // f_blocks
-    put(&mut out, 24, 1 << 19); // f_bfree
-    put(&mut out, 32, 1 << 19); // f_bavail
+    put(&mut out, 16, 1 << 26); // f_blocks
+    put(&mut out, 24, 3 << 24); // f_bfree
+    put(&mut out, 32, 3 << 24); // f_bavail
     put(&mut out, 40, 1 << 18); // f_files
     put(&mut out, 48, 1 << 17); // f_ffree
     // f_fsid (8 bytes) at 56
@@ -13488,6 +13632,7 @@ mod tests {
         statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
         let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
         assert_eq!(q(8), 4096, "f_bsize");
+        assert!(q(32) * q(8) >= 64 << 30, "f_bavail: room for a large installer");
         assert_eq!(q(56), 0, "f_fsid");
         assert_eq!(q(64), 255, "f_namelen");
         assert_eq!(q(72), 4096, "f_frsize");
@@ -18004,6 +18149,14 @@ pub const W64_CODE_TOP: u64 = 0x7fff_0000;
 /// relocation directory), so it goes at its preferred base alone, and that
 /// base puts it above [`W64_CODE_TOP`] (a linker's default x86-64 base,
 /// 0x140000000, is). Anything else, or headers that do not parse: false.
+/// Whether `head` is a PE32 image's (a 32-bit Windows program or DLL).
+pub fn pe_is_32bit(head: &[u8]) -> bool {
+    let at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let nt = head.get(0x3c..0x40).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    head.get(..2) == Some(b"MZ")
+        && nt.is_some_and(|nt| head.get(nt..nt + 4) == Some(b"PE\0\0") && at(nt + 24) == Some(0x10b))
+}
+
 pub fn pe_needs_mem64(head: &[u8]) -> bool {
     let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -18032,7 +18185,16 @@ pub fn pe_needs_mem64(head: &[u8]) -> bool {
 
 #[cfg(test)]
 mod pe_mem64_tests {
-    use super::pe_needs_mem64;
+    use super::{pe_is_32bit, pe_needs_mem64};
+
+    #[test]
+    fn pe32_is_32bit() {
+        let mut b = pe(0x400000, 0x102, 0x100, 0x14c);
+        b[0x98..0x9a].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert!(pe_is_32bit(&b));
+        assert!(!pe_is_32bit(&pe(0x140000000, 0x22, 0x100, 0x8664)));
+        assert!(!pe_is_32bit(b"\x7fELF"));
+    }
 
     /// A minimal PE32+ header: `base`, `chars`, the relocation directory's size.
     fn pe(base: u64, chars: u16, relocs: u32, machine: u16) -> Vec<u8> {

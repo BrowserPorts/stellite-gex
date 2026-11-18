@@ -783,3 +783,44 @@ pub extern "C" fn gex_fjit_report() {
         crate::warn_line(&format!("[gex] fjit: {} (translated {}, declined {})\n", jit.stats(), TRANSLATED.load(Ordering::Relaxed), DECLINED.load(Ordering::Relaxed)));
     }
 }
+
+/// libffi's call thunks (gexcc-win's libffi, `gex.ffi_thunk`), by signature:
+/// their slots. A forked child has its parent's with the memory it copied.
+static FFI_THUNKS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+/// `gex.ffi_thunk`'s shim half: the slot of the call thunk for the wasm
+/// signature in `buf` (`len` bytes, the shim's heap; `gex_cgen::ffi`), made
+/// and published once per process as a JIT module, which every Worker
+/// installs as it replays the function table's log (JS catches the asking
+/// Worker up before handing the value back). `u32::MAX` for a signature
+/// that is not one (said on stderr).
+#[no_mangle]
+pub extern "C" fn gex_ffi_thunk(buf: u32, len: u32) -> u32 {
+    // SAFETY: JS wrote `len` bytes at `buf`, a `gex_alloc` block of this heap.
+    let bytes = unsafe { std::slice::from_raw_parts(buf as usize as *const u8, len as usize) };
+    let Ok(sig) = std::str::from_utf8(bytes) else {
+        crate::warn_line("gex.ffi_thunk: the signature is not text\n");
+        return u32::MAX;
+    };
+    if let Some(&k) = lock(&FFI_THUNKS).as_ref().and_then(|m| m.get(sig)) {
+        return k;
+    }
+    let wasm = match gex_cgen::ffi::thunk(sig) {
+        Ok(w) => w,
+        Err(e) => {
+            crate::warn_line(&format!("gex.ffi_thunk: {e}\n"));
+            return u32::MAX;
+        }
+    };
+    // (held across the publish, as `translate_root`: a Worker replaying the
+    // log waits for the bytes rather than reading nothing)
+    let mut modules = lock(&MODULES);
+    let n = modules.len() as u32;
+    let install = crate::cgen::publish(1, FJIT | n, gex_kernel::ftab::Tier::Jit, &[]);
+    modules.push(Module { wasm, regs: Vec::new(), dirs: Vec::new(), slots: 0 });
+    drop(modules);
+    let base = crate::cgen::gex_ftab_install_base(install);
+    // (two Workers making one at once: the first stays; the other's install
+    // still takes a slot in every Worker's table, unused)
+    *lock(&FFI_THUNKS).get_or_insert_with(Default::default).entry(sig.to_string()).or_insert(base)
+}

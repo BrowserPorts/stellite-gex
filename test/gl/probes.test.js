@@ -19,7 +19,7 @@ import { MesaGl } from '../../page/runtime/src/gl.js';
 const KNOWN = {
   'gl44-two-contexts-probe': {
     line: 'SUMMARY cases=8 passed=7 failed=1',
-    why: "every context shares the first one's objects (CONTEXT_ADD), so an unshared context sees the other's buffer",
+    why: "every context is in the first one's share group (CONTEXT_CURRENT), so an unshared context sees the other's buffer",
   },
 };
 

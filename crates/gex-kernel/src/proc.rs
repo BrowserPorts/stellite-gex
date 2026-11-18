@@ -386,6 +386,8 @@ struct Proc {
     crash: Vec<u8>,
     /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
     crash_more: Vec<u8>,
+    /// The notices it has given ([`ProcTable::notice`]), each given once.
+    noticed: Vec<String>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -411,8 +413,16 @@ pub const PR_GEX_CRASH: u64 = 0x4745_0002;
 /// `prctl` option gex adds: a reservation of `arg2` bytes with no address
 /// could not be placed in the calling process's lowered memory (64-bit
 /// Wine's `map_view`, which looks for room itself and never asks the
-/// kernel for a mapping it has no gap for). `Kernel::note_short`.
+/// kernel for a mapping it has no gap for). `Kernel::note_short`. With
+/// `arg3` 1 the caller can start its program again itself, and 1 back says
+/// to, in place of its end (`outgrow_restart`).
 pub const PR_GEX_SHORT: u64 = 0x4745_0003;
+
+/// `prctl` option gex adds: why the calling process cannot work as it
+/// should, for whoever runs it to see while it runs (`arg2` the text's
+/// address, `arg3` its length): a need no memory gex has can meet, which
+/// the program goes on without. [`ProcTable::notice`].
+pub const PR_GEX_NOTICE: u64 = 0x4745_0004;
 
 /// A note's first byte when it gives way to one the process gave itself
 /// ([`ProcTable::set_crash_unless_said`]).
@@ -421,6 +431,13 @@ const UNLESS_SAID: u8 = 1;
 /// A note's first byte when the rest is one more line for its crash's
 /// reason ([`ProcTable::add_crash_line`]).
 const ADD_LINE: u8 = 2;
+
+/// A note's first byte when the rest is a notice, not a crash
+/// ([`ProcTable::notice`]).
+const NOTICE: u8 = 3;
+
+/// The longest notice kept.
+const NOTICE_MAX: usize = 512;
 
 /// The most crashes kept for a reader that has not taken them.
 const CRASHES_KEPT: usize = 64;
@@ -439,6 +456,9 @@ pub struct Crash {
     pub code: u32,
     /// The signal that ended it, 0 for none.
     pub signal: u32,
+    /// A notice of a process that is still running ([`ProcTable::notice`]),
+    /// `reason` its text, not a crash.
+    pub notice: bool,
 }
 
 /// The signals whose default action dumps core: a program's crash.
@@ -484,10 +504,12 @@ impl Crash {
             },
             code,
             signal: if signaled { sig } else { 0 },
+            notice: false,
         })
     }
 
-    /// As one line of JSON: `{"pid","name","reason","code","signal"}`.
+    /// As one line of JSON: `{"pid","name","reason","code","signal"}`, and
+    /// `"notice":true` for a notice.
     pub fn json(&self) -> String {
         fn q(s: &str) -> String {
             let mut o = String::from('"');
@@ -502,7 +524,8 @@ impl Crash {
             o.push('"');
             o
         }
-        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
+        let notice = if self.notice { r#","notice":true"# } else { "" };
+        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}{notice}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
     }
 }
 
@@ -512,6 +535,11 @@ static CRASH_HOOK: std::sync::OnceLock<fn(&Crash)> = std::sync::OnceLock::new();
 /// Have `f` hear of each crash the table records (a native host's line).
 pub fn set_crash_hook(f: fn(&Crash)) {
     let _ = CRASH_HOOK.set(f);
+}
+
+/// Whether this host reports crashes and notices itself ([`set_crash_hook`]).
+pub fn crash_hook_set() -> bool {
+    CRASH_HOOK.get().is_some()
 }
 
 struct Table {
@@ -539,6 +567,28 @@ impl Table {
         let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)) else {
             return false;
         };
+        if let Some(f) = CRASH_HOOK.get() {
+            f(&c);
+        }
+        if self.crashes.len() >= CRASHES_KEPT {
+            self.crashes.pop_front();
+        }
+        self.crashes.push_back(c);
+        true
+    }
+
+    /// Process `pid`'s notice `text` ([`ProcTable::notice`]), unless it gave
+    /// it before: heard by the host's hook and kept for the reader. Whether
+    /// it was new.
+    fn record_notice(&mut self, pid: i32, text: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(text).into_owned();
+        let Some(p) = self.procs.iter_mut().find(|p| p.pid == pid) else { return false };
+        if text.is_empty() || p.noticed.contains(&text) {
+            return false;
+        }
+        p.noticed.push(text.clone());
+        let end = p.info.iter().position(|&b| b == b'\n').unwrap_or(p.info.len());
+        let c = Crash { pid, name: String::from_utf8_lossy(&p.info[..end]).into_owned(), reason: text, code: 0, signal: 0, notice: true };
         if let Some(f) = CRASH_HOOK.get() {
             f(&c);
         }
@@ -656,6 +706,7 @@ impl ProcTable {
                     usage: Usage::default(),
                     crash: Vec::new(),
                     crash_more: Vec::new(),
+                    noticed: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
@@ -703,6 +754,7 @@ impl ProcTable {
             usage: Usage::default(),
             crash: Vec::new(),
             crash_more: Vec::new(),
+            noticed: Vec::new(),
         });
         pid
     }
@@ -815,6 +867,12 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.set_crash)(pid, note.as_ptr() as usize as crate::PAddr, note.len() as u32);
         }
+        if let Some((&NOTICE, text)) = note.split_first() {
+            if self.lock().record_notice(pid, text) {
+                self.crash_notify();
+            }
+            return;
+        }
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             match note.split_first() {
                 Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
@@ -843,6 +901,21 @@ impl ProcTable {
         let mut v = Vec::with_capacity(line.len() + 1);
         v.push(ADD_LINE);
         v.extend_from_slice(line.as_bytes());
+        self.set_crash(pid, &v);
+    }
+
+    /// Why process `pid`, still running, cannot work as it should (`text`,
+    /// one line), for the reader of crashes as a notice ([`Crash::notice`])
+    /// and the host's crash hook: each text once a process.
+    pub fn notice(&self, pid: i32, text: &str) {
+        let text = text.trim_end();
+        let mut cut = text.len().min(NOTICE_MAX);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut v = Vec::with_capacity(cut + 1);
+        v.push(NOTICE);
+        v.extend_from_slice(&text.as_bytes()[..cut]);
         self.set_crash(pid, &v);
     }
 
@@ -1623,9 +1696,27 @@ mod tests {
         t.exit(d, 15);
         let got = t.take_crashes();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11 });
-        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0 });
+        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11, notice: false });
+        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0, notice: false });
         assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
+        assert!(t.take_crashes().is_empty());
+    }
+
+    #[test]
+    fn a_notice_is_given_once_and_is_no_crash() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_info(a, b"big.exe\nbig.exe\0");
+        t.notice(a, "needs more than 16 GiB of address space\n");
+        t.notice(a, "needs more than 16 GiB of address space");
+        t.notice(a, "another");
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Crash { pid: a, name: "big.exe".into(), reason: "needs more than 16 GiB of address space".into(), code: 0, signal: 0, notice: true });
+        assert_eq!(got[0].json(), format!(r#"{{"pid":{a},"name":"big.exe","reason":"needs more than 16 GiB of address space","code":0,"signal":0,"notice":true}}"#));
+        assert_eq!(got[1].reason, "another");
+        // it ends normally afterwards: no crash
+        t.exit(a, 0);
         assert!(t.take_crashes().is_empty());
     }
 

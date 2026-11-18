@@ -63,6 +63,8 @@ pub(crate) struct Shared {
     /// (`ftab::Request::process`): one per process image, shared with a
     /// forked child until it `execve`s.
     pub process: Process,
+    /// libffi's call thunks (`gex.ffi_thunk`), by signature: their slots.
+    pub ffi_thunks: HashMap<String, u32>,
 }
 
 impl Shared {
@@ -86,6 +88,7 @@ impl Shared {
             providers: self.providers.clone(),
             alt_installs: self.alt_installs.clone(),
             process: Process::default(),
+            ffi_thunks: self.ffi_thunks.clone(),
         }
     }
 }
@@ -561,6 +564,43 @@ pub(crate) fn bind_pairs(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemo
         gex_kernel::ftab::fcache_clear(&mut GuestMem::new(data), a);
     }
     publish_bridges(sh, &entries, &[])
+}
+
+/// `gex.ffi_thunk(sig, len)` (gexcc-win's libffi): the function value of the
+/// call thunk for the wasm signature at `sig` (`gex_cgen::ffi`), made and
+/// published once per process, and in this thread's table before it
+/// returns. Other threads take it as they catch up, before they can be
+/// handed its value (an index at or past their ICALL bound catches up).
+pub(crate) fn register_ffi(linker: &mut wasmtime::Linker<HostState>) -> Result<()> {
+    linker.func_wrap(gex_abi::IMPORT_MODULE, "ffi_thunk", |mut caller: Caller<'_, HostState>, sig: i64, len: i32| -> wasmtime::Result<i64> {
+        crate::host((|| -> anyhow::Result<i64> {
+            let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let sig = {
+                let b = memory.bytes();
+                let (at, n) = (sig as u64 as usize, len as u32 as usize);
+                let s = b.get(at..at + n).ok_or_else(|| anyhow!("gex.ffi_thunk: signature at {at:#x}+{n} is outside memory"))?;
+                String::from_utf8(s.to_vec()).map_err(|_| anyhow!("gex.ffi_thunk: signature is not text"))?
+            };
+            let sh = shared(&caller)?;
+            let known = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.ffi_thunks.get(&sig).copied();
+            let slot = match known {
+                Some(k) => k,
+                None => {
+                    let wasm = gex_cgen::ffi::thunk(&sig).map_err(|e| anyhow!("gex.ffi_thunk: {e}"))?;
+                    let module = Module::new(caller.engine(), &wasm).context("gex.ffi_thunk: compiling the thunk")?;
+                    let n = publish(&sh, &memory, module, &[0], Tier::Jit, Vec::new())?;
+                    let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
+                    let base = s.ftab.map.installs()[n as usize].base;
+                    // (two threads making one at once: the first stays; the
+                    // other's install still takes a table slot, unused)
+                    *s.ftab.ffi_thunks.entry(sig).or_insert(base)
+                }
+            };
+            catch_up(&mut caller)?;
+            Ok(slot as i64)
+        })())
+    })?;
+    Ok(())
 }
 
 /// The function at `idx` of this store's table (a C function pointer of a

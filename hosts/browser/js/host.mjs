@@ -26,6 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { HELPER_STACK_COUNT, wasmMemory } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
@@ -79,10 +80,65 @@ function watchLibraries() {
 /** A Worker's note (fetch-note.mjs): seen here, and said on the channel for
  *  the page (app.js `watchFetches`), which this side's own channel is not
  *  handed back. */
-function relayNote(note) {
+function relayNote(note, pid) {
   seeLibrary(note?.status);
+  watchWait(note, pid);
   watchLibraries();
   try { libChannel?.postMessage(note); } catch {}
+}
+
+// A Worker's fetch or wait that has gone on for WAIT_SAY_MS (a noted fetch,
+// fetch-note.mjs: a lazy file's read, a unit's file, the fill), said once
+// with what it waits on and for which process, and again when it ends: a
+// process stuck in one shows up as that line, not as silence.
+const WAIT_SAY_MS = 10_000;
+const waits = new Map();
+const waitSums = new Map();
+let waitTimer = null;
+function watchWait(note, pid) {
+  if (!note?.id || (note.phase !== 'start' && note.phase !== 'end')) return;
+  if (note.phase === 'end') {
+    const w = waits.get(note.id);
+    waits.delete(note.id);
+    if (w?.said) inform(`[gex] pid ${w.pid}: done waiting on ${w.what} after ${((performance.now() - w.t0) / 1000).toFixed(1)} s`);
+    // Short waits that add up: a process making one blocking fetch after
+    // another (each image's unit file) on a slow link.
+    else if (w) {
+      const a = waitSums.get(w.pid) ?? { n: 0, ms: 0, from: w.t0 };
+      a.n++;
+      a.ms += performance.now() - w.t0;
+      a.last = w.what;
+      waitSums.set(w.pid, a);
+      if (a.ms >= WAIT_SAY_MS) {
+        inform(`[gex] pid ${w.pid}: ${a.n} fetches waited ${(a.ms / 1000).toFixed(1)} s in the last ${((performance.now() - a.from) / 1000).toFixed(0)} s (the last ${a.last})`);
+        waitSums.delete(w.pid);
+      }
+    }
+  } else waits.set(note.id, { what: note.what, owner: note.owner, pid: pid ?? '?', t0: performance.now(), said: false });
+  if ((waits.size || waitSums.size) && !waitTimer) {
+    waitTimer = setInterval(() => {
+      const now = performance.now();
+      // (a sum as old as a minute starts again)
+      for (const [pid, a] of waitSums) if (now - a.from > 60_000) waitSums.delete(pid);
+      for (const w of waits.values()) {
+        if (w.said || now - w.t0 < WAIT_SAY_MS) continue;
+        w.said = true;
+        inform(`[gex] pid ${w.pid}${w.owner ? ` (${w.owner})` : ''}: waiting ${((now - w.t0) / 1000).toFixed(0)} s on ${w.what}`);
+      }
+      if (!waits.size && !waitSums.size) { clearInterval(waitTimer); waitTimer = null; }
+    }, 2000);
+    waitTimer.unref?.();
+  }
+}
+
+/** A process or thread Worker's `error` or `messageerror` event, said
+ *  always (a critical error): before this a process Worker's was only a
+ *  rejected promise nobody may await, and the process looked hung. Where the
+ *  event says, the script and line it came from. */
+function workerFailed(pid, role, e) {
+  const what = e?.message ?? (e?.type === 'messageerror' ? 'a message that could not be read' : String(e));
+  const at = e?.filename ? ` (${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'})` : '';
+  console.error(`[gex] pid ${pid} (${role} Worker): failed: ${what}${at}`);
 }
 
 function crashed(what) {
@@ -1121,6 +1177,9 @@ export class ProcessHost {
     // Including the warm ones nobody claimed.
     for (const w of this.#warm) w.terminate();
     this.#warm = [];
+    this.#usdClock?.terminate();
+    this.#usdClock = null;
+    this.#usdPids.clear();
     // A later `start` saves again (a Worker cut off inside a save left its count).
     if (this.#saveGate) this.#saveGate.fill(0);
   }
@@ -1144,11 +1203,13 @@ export class ProcessHost {
       w.addEventListener?.('message', onEvent);
       w.on?.('message', onMsg);
       const fail = (e) => {
+        workerFailed(pid, 'process', e);
         this.#workers.delete(pid);
         reject(e instanceof Error ? e : new Error(e?.message ?? String(e)));
       };
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
+      w.addEventListener?.('messageerror', fail);
       w[LISTENING] = { onEvent, onMsg, fail };
       this.#pending.set(pid, { ...msg, pid });
       const kind = msg.kind;
@@ -1270,6 +1331,7 @@ export class ProcessHost {
     w.removeEventListener?.('message', l.onEvent);
     w.off?.('message', l.onMsg);
     w.removeEventListener?.('error', l.fail);
+    w.removeEventListener?.('messageerror', l.fail);
     w.off?.('error', l.fail);
     w[REUSES] = n;
     this.#reused++;
@@ -1440,10 +1502,12 @@ export class ProcessHost {
     // A thread that throws, said out loud: a thread Worker had no `error`
     // listener, so an exception was swallowed and read as a hang.
     const threadFailed = (e) => {
+      workerFailed(pid, `thread ${ref.key}`, e);
       this.#onOutput(2, `gex: thread ${ref.key} failed: ${e?.message ?? String(e)}\n`, pid);
       crashed(`thread ${ref.key}: ${e?.message ?? String(e)}`);
     };
     w2.addEventListener?.('error', threadFailed);
+    w2.addEventListener?.('messageerror', threadFailed);
     w2.on?.('error', threadFailed);
     // Sent from the `ready` case, which finds it here.
     this.#pending.set(key, rec);
@@ -1651,6 +1715,45 @@ export class ProcessHost {
     return best < 0 ? undefined : this.#recycled.splice(best, 1)[0];
   }
 
+  /** The one Worker that advances every Wine process's KUSER_SHARED_DATA
+   *  clocks (usd-clock.mjs), made at the first process that asks
+   *  (`gex.usd_tick`); it holds no runtime. In the single-thread build, the
+   *  clock itself, driven the same way. */
+  #usdClock = null;
+  #usdPids = new Set();
+  #usdTick(pid, m) {
+    if (!(m.memory instanceof WebAssembly.Memory)) return;
+    const proc = Number(String(pid).split(':')[0]);
+    if (!this.#usdClock) {
+      // The single-thread build's processes are fibers of this realm: the
+      // clock is here, its timer stopped with the host (a fiber's end would
+      // leave it running, and Node's run with it).
+      this.#usdClock = SP_CODE && single.on ? UsdClock.inRealm() : this.#makeWorker();
+      if (this.#door) this.#usdClock.postMessage({ kind: 'usdClock', op: 'door', door: this.#door });
+    }
+    this.#usdPids.add(proc);
+    this.#usdClock.postMessage({ kind: 'usdClock', op: 'add', pid: proc, memory: m.memory, at: m.at, clock: m.clock });
+  }
+  /** The Worker `pid` ended (no other Worker carries its process on): the
+   *  process has ended when that was its own Worker, or a thread's with
+   *  none of the process's other threads left (its first thread had gone
+   *  before it). A thread that ends while its process runs leaves the page. */
+  #usdEnded(pid) {
+    const key = String(pid), proc = key.split(':')[0];
+    if (key !== proc) {
+      for (const k of this.#workers.keys()) {
+        const o = String(k);
+        if (o !== key && o.split(':')[0] === proc && !o.includes(':spare')) return;
+      }
+    }
+    this.#usdDrop(Number(proc));
+  }
+  /** Process proc ended: its page is no longer written (nor its memory held). */
+  #usdDrop(proc) {
+    if (!this.#usdPids.delete(proc)) return;
+    this.#usdClock?.postMessage({ kind: 'usdClock', op: 'drop', pid: proc });
+  }
+
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
@@ -1732,11 +1835,14 @@ export class ProcessHost {
         break;
       }
       case 'note':
-        relayNote(m.note);
+        relayNote(m.note, pid);
         break;
       case 'loadOther':
         // An exec waits on the gate (`#otherGate`) for the answer.
         this.#loadOther().catch(() => {});
+        break;
+      case 'usdTick':
+        this.#usdTick(pid, m);
         break;
       case 'doorPublish': {
         // The wineserver's door: every Worker of
@@ -1744,6 +1850,7 @@ export class ProcessHost {
         this.#door = m.door;
         narrate(`[host] wineserver pid ${m.door?.pid} published its door`);
         for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
+        this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: m.door });
         break;
       }
       case 'wantLibrary':
@@ -2067,6 +2174,7 @@ export class ProcessHost {
           const c = this.#carried.get(proc);
           this.#onExit(m, proc);
           forgetMemory(proc);
+          this.#usdDrop(proc);
           this.#release(pid, w);
           if (c?.resolve) {
             this.#carried.delete(proc);
@@ -2092,7 +2200,9 @@ export class ProcessHost {
           Atomics.notify(i32, a);
           this.#door = null;
           for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
+          this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: null });
         }
+        this.#usdEnded(pid);
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
@@ -2110,6 +2220,9 @@ export class ProcessHost {
           const t = m.traps;
           console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
         }
+        // `?systime=1`: where the process's syscall time went, by call (asked
+        // for, so said whatever the log level).
+        if (m.sysTimes) console.log(`[gex] pid ${pid}: syscalls ${m.sysTimes}${m.cmdline ? ` {${m.cmdline}}` : ''}`);
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, except under run-node
         // (`ownExitLines`), which prints its own.
@@ -2133,10 +2246,15 @@ export class ProcessHost {
               (m.slotsLeftK >= 0 ? `, ${m.slotsLeftK}k dispatch slots left` : '') +
               // What this process's memory grew to. One memory per process, so
               // this times the number live at once is what the tab costs.
-              (m.memoryMib !== undefined ? `, memory ${m.memoryMib} MiB` : '') +
+              // Its size, not what is used: a memory64 is 8 GiB from the start.
+              (m.memoryMib !== undefined ? `, memory size ${m.memoryMib} MiB` : '') +
+              // Its pages that hold anything: what the browser keeps resident.
+              (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') +
               // And what that memory went on, which is the only way to tell a
-              // guest that really maps a lot from a runtime spending it.
-              (m.arena ? ` (maps ${m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
+              // guest that really maps a lot from a runtime spending it: the
+              // guest's accessible mappings (its VmRSS, in either memory
+              // flavour), the runtime's heap, Worker stacks.
+              (m.arena ? `, in use ${(m.guestMib ?? m.arena[0]) + m.arena[1] + m.arena[2]} MiB (maps ${m.guestMib ?? m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
               // Dense modules this Worker left for a miss, and those a miss took.
               (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
               (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +

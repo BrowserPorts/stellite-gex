@@ -189,6 +189,24 @@ pub mod program_flags {
             })
             .unwrap_or(0)
     }
+
+    /// A native wasm32 program's module, from its GEXWASM header: its
+    /// address in the image and its length (`header` the header's first 36
+    /// bytes). `None` for a header that is not one, or another version.
+    pub fn module_at(header: &[u8]) -> Option<(u64, u64)> {
+        if header.len() < 20 || &header[..8] != MAGIC {
+            return None;
+        }
+        let w = |o: usize| u32::from_le_bytes(header[o..o + 4].try_into().unwrap()) as u64;
+        (w(8) == 1).then(|| (w(12), w(16)))
+    }
+
+    /// [`module_at`] of `exe`'s header, when the image holds it.
+    pub fn module(exe: &gex_ld::elf::Image) -> Option<(u64, u64)> {
+        let at = exe.entry.wrapping_sub(0x40);
+        let s = exe.segments.iter().find(|s| at >= s.vaddr && at + 20 <= s.vaddr + s.bytes.len() as u64)?;
+        module_at(&s.bytes[(at - s.vaddr) as usize..])
+    }
 }
 
 /// What decides a new process's unit flavour, all known before any image is

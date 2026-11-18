@@ -90,9 +90,25 @@ const perf = globalThis.performance;
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
-import { logNamed, setLog } from './log.mjs';
+import { logNamed, logOn, setLog } from './log.mjs';
+
+/** The MiB of `memory` in 64 KiB pages not all zero: what a browser holds
+ *  resident for it, near enough (a page written and zeroed again is the only
+ *  miss). */
+function touchedMib(memory) {
+  const words = new Uint32Array(memory.buffer);
+  let pages = 0;
+  for (let p = 0; p < words.length; p += 16384) {
+    const end = Math.min(p + 16384, words.length);
+    for (let i = p; i < end; i++) {
+      if (words[i]) { pages++; break; }
+    }
+  }
+  return Math.round(pages / 16);
+}
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -190,6 +206,8 @@ if (!(SP_CODE && single.on)) setNoteSink((note) => port.post({ kind: 'note', not
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// The host's USD clock, in the one Worker the host keeps for it.
+let usdClock = null;
 /// The unit cache's small files the page's Workers read before this one
 /// started (host.mjs `#unitFiles`), by path; null for one the cache lacks.
 const unitFiles = new Map();
@@ -460,6 +478,15 @@ async function handle(msg) {
     });
     return;
   }
+  // The host's clock of the Wine processes' user shared data pages
+  // (usd-clock.mjs): this Worker runs no process, only that.
+  if (msg?.kind === 'usdClock') {
+    usdClock ??= new UsdClock();
+    if (msg.op === 'add') usdClock.add(msg.pid, msg.memory, msg.at, msg.clock);
+    else if (msg.op === 'drop') usdClock.drop(msg.pid);
+    else if (msg.op === 'door') usdClock.door(msg.door);
+    return;
+  }
   // The wineserver's door, from the host: this Worker's door calls go to it
   // from its next one. Before this Worker has a `Gex`, the start message
   // carries it instead.
@@ -664,6 +691,12 @@ async function handle(msg) {
     // the host forgets them too, or its relay keeps their code alive.
     dropModules(keys) {
       port.post({ kind: 'droppedModules', keys });
+    }
+    // This process's KUSER_SHARED_DATA copy (`gex.usd_tick`): up to the
+    // host, whose clock advances it from now on.
+    // (Its own memory: the single-thread build's fibers share this module.)
+    usdTick(at, clock, memory) {
+      port.post({ kind: 'usdTick', at, clock, memory: memory ?? workerGex?.memory });
     }
     // The wineserver published its door: up to
     // the host, which hands it to every Worker of the session.
@@ -1269,6 +1302,7 @@ async function handle(msg) {
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.fcacheStats) gex.shim.exports.gex_set_fcache_stats?.(1);
+    if (msg.sysTime) gex.shim.exports.gex_set_sys_time?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }
@@ -1465,6 +1499,16 @@ async function handle(msg) {
       threadGone: thread && !asThread ? true : undefined,
       carries: carries || undefined,
       guestMillis,
+      // `?systime=1`: the process's syscalls by time (the shim's `gex_sys_times`).
+      sysTimes: msg.sysTime && !thread ? (() => {
+        const e = gex.shim.exports;
+        if (!e.gex_sys_times) return undefined;
+        const p = e.gex_alloc(2048) >>> 0;
+        const n = e.gex_sys_times(p, 2048) >>> 0;
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, 2048);
+        return t || undefined;
+      })() : undefined,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
       // address space goes away with this thread.
@@ -1535,6 +1579,11 @@ async function handle(msg) {
       // What this process's memory grew to -- the question is whether a forked
       // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // And what of it holds anything: its pages not all zero, MiB, which is
+      // what the browser keeps resident for it (a memory's size is not: a
+      // memory64 is 8 GiB from its first instruction). Only where the exit
+      // line is said: a pass over the whole memory.
+      touchedMib: logOn('debug') || logNamed('touched') || globalThis.process?.env?.GEX_DEBUG_EXIT ? touchedMib(gex.memory) : undefined,
       // Dispatch slots the page has left, in thousands. A budget nothing
       // refills: when it runs out, the next module names a table that does not
       // exist and the engine refuses it. Per process, because the question is
@@ -1548,8 +1597,12 @@ async function handle(msg) {
       forkZeros: gex.forkZeroBytes,
       // A posix_spawn child that ran in its parent's Worker until this exec.
       vforkMs: msg.child?.vforkMs,
+      // (and the largest single claim of the four)
+      // The guest's accessible mappings (VmRSS), MiB: its share of `arena`'s
+      // total in either memory flavour.
+      guestMib: gex.shim.exports.gex_guest_mapped_mib ? Number(gex.shim.exports.gex_guest_mapped_mib()) : undefined,
       arena: gex.shim.exports.gex_arena_spent_mib
-        ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
+        ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
     };
     // Last: nothing calls into this instance after (`releaseWorker`).

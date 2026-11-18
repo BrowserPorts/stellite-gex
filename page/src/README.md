@@ -53,11 +53,13 @@ Every option is optional. A default comes from the build
 | `debug` | other runtime switches, `{name: value}`, as gex's test page's `?name=value` |
 | `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out). `compositor: false` draws windows straight into the page. `hostx: 'rootful'` is one fullscreen X screen |
 | `glLazy` | start Mesa at the first GL request, not at boot |
+| `restAhead` | `true`: the whole rest bundle downloads in the background as soon as the title files are in (low priority, a read's own fetch first, paused while the page is hidden), so later reads find it held. Default `false`: a rest bundle's frames are fetched by Range at their first read only. The `restahead` switch (`debug: { restahead: '0' }` or `'1'`) overrides it |
 | `background` | the desktop behind the windows: a colour, `'#rrggbb'` (default the compositor's dark grey), or `{color, image, anchor}`: an image (URL or Blob) over the colour, scaled to cover, its `anchor` edge (`'top'`, `'center'`, `'bottom'`) always showing; the colour shows until the image is decoded |
 | `ready` | `'frame'` (default): the start-up is over at the first frame. `'manual'`: when the page calls `ready()` |
 | `onLog(text)` | the program's terminal output |
 | `onExit(status)` | called when it exits |
 | `onCrash({ pid, name, reason, code, signal })` | a program of the run crashed: any of them, not only the first (the System's `crash` event, `page/runtime/README.md`). It has ended and its windows are gone by then; the page says so its own way |
+| `onNotice({ pid, name, text })` | why a program that is still running cannot work as it should (the System's `notice` event), such as a need for more address space than any memory gex has: once per program and text; the page shows it its own way |
 | `onProgress(p)` | the start-up's progress, for a loading screen (`crates/gex-eject/README.md`, "The loading screen") |
 | `onStoreBusy({ name, signal })` | an OPFS `filesystem` open in another tab of the site (one page holds a store at a time): return `'memory'` to run without keeping files, or anything else to wait; start-up goes on by itself once the other tab closes, and `signal` is aborted. Without it a busy store fails the start (`EBUSY`) |
 | `baseUrl` | where `app.mjs`'s files are; default beside `app.mjs` |

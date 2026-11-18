@@ -907,6 +907,30 @@ impl MemoryMap {
         self.fixed_only.sort_unstable();
     }
 
+    /// The highest `len` free bytes in `[lo, hi)`, page-aligned, inside
+    /// this map's arena and clear of every mapping and of the fixed-only
+    /// ranges: for a mapping that has to be in a window of its own (mapped
+    /// there then with `MAP_FIXED_NOREPLACE`).
+    pub fn find_free_down(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
+        for &(a, b) in self.arena.iter().rev() {
+            let (a, b) = (a.max(lo), b.min(hi));
+            let mut candidate = b;
+            while candidate >= a + len {
+                let start = page_align_down(candidate - len);
+                if start < a {
+                    break;
+                }
+                let mapped = self.vmas.iter().filter(|v| v.start < start + len && v.end > start).map(|v| v.start);
+                let fixed = self.fixed_only.iter().filter(|&&(x, y)| x < start + len && y > start).map(|&(x, _)| x);
+                match mapped.chain(fixed).min() {
+                    Some(below) => candidate = below,
+                    None => return Some(start),
+                }
+            }
+        }
+        None
+    }
+
     /// The arena spans this map has been handed (sorted, disjoint).
     pub fn arena_spans(&self) -> &[(u64, u64)] {
         &self.arena

@@ -730,6 +730,12 @@ export class System extends EventTarget {
           if (!line) continue;
           let c;
           try { c = JSON.parse(line); } catch { continue; }
+          // a running program's notice (why it cannot work as it should)
+          // (its line is the shim's, said as it was made)
+          if (c.notice) {
+            this.dispatchEvent(Object.assign(new Event('notice'), { pid: c.pid, name: c.name, text: c.reason }));
+            continue;
+          }
           this.#say(`[gex] pid ${c.pid}${c.name ? ` (${c.name})` : ''} crashed: ${c.reason}\n`);
           this.dispatchEvent(Object.assign(new Event('crash'), c));
         }

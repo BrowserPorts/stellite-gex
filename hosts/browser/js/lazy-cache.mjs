@@ -101,9 +101,15 @@ export function cachedRead(href, from, dst, len) {
   Atomics.add(ctl, 0, 1);
   Atomics.notify(ctl, 0);
   const t0 = Date.now();
+  let said = false;
   for (;;) {
     const st = Atomics.load(ctl, base);
     if (st === DONE) break;
+    // a read that stalls its program, said once (the owner says on what)
+    if (!said && Date.now() - t0 > 10000) {
+      said = true;
+      console.warn(`[gex] a read of ${href} @${from} has waited 10 s for the page's lazy files (${st === ASKED ? 'not taken yet' : 'taken'})`);
+    }
     if (st === ASKED && Date.now() - t0 > WAIT_MS) {
       if (Atomics.compareExchange(ctl, base, ASKED, GIVEN_UP) === ASKED) return -1;
       continue;

@@ -112,6 +112,11 @@ const PIECES = {
  *              image is decoded; the image is fetched at start, beside the bundle.
  *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
+ *   restAhead  true: the whole rest bundle downloaded in the background as soon as
+ *              the title files are in, at low priority, a read's own fetch first;
+ *              default false: a rest bundle's frames fetched at their first read only
+ *              (the shared-memory build's: the single-thread build has no lazy files'
+ *              owner, and reads every frame at its first read either way)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
@@ -120,6 +125,14 @@ const PIECES = {
  *   onCrash({ pid, name, reason, code, signal })
  *              a program of the run crashed (the System's `crash` event,
  *              page/runtime README): it has ended and its windows are gone
+ *   onGlCapture(bytes)
+ *              the GL stream's recording (a .gexgltr file, gl-capture.js),
+ *              asked for with `debug: { glcapture: BYTES }`, once it is that
+ *              long: for the page to save. Without it the recording is POSTed
+ *              to /__gex_capture.
+ *   onNotice({ pid, name, text })
+ *              why a running program cannot work as it should (the System's
+ *              `notice` event): once per program and text
  *   hostCalls  {name: fn}: the page's answers to the program's calls through
  *              /dev/gex-host (the System's `hostCalls`, page/runtime README),
  *              registered as the run's system starts. fn(args) is given the
@@ -861,11 +874,13 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
-        // The rest bundles downloaded in the background as soon as the title files are in (the pieces, the
-        // streamed archive), not after the start-up: the program does not wait for them, and the reads after
-        // find their frames in the owner's store (none while the page is hidden).
+        // With `restAhead`, the rest bundles downloaded in the background as soon as the title files are in
+        // (the pieces, the streamed archive), not after the start-up: the program does not wait for them, and
+        // the reads after find their frames in the owner's store (none while the page is hidden). Without it a
+        // rest bundle is read on demand only, a frame at its first read. The `restahead` switch ('1' or '0')
+        // overrides the option.
         const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
-        if (restBundles.length && sw.restahead !== '0') {
+        if (restBundles.length && (sw.restahead !== undefined ? sw.restahead !== '0' : opts.restAhead === true)) {
           const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
           Promise.allSettled([pieceBufs, streamed?.done]).then(() => {
             w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
@@ -964,9 +979,13 @@ async function begin(opts, base, at, state, meter, lets) {
         state.error = String(e.error?.stack ?? e.error);
         meter.end('failed', state.error);
       });
+      if (opts.onGlCapture) globalThis.__gexGlCaptureSink = opts.onGlCapture;
       for (const [name, fn] of Object.entries(opts.hostCalls ?? {})) s.system.hostCalls.register(name, fn);
       if (opts.onCrash) {
         s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
+      }
+      if (opts.onNotice) {
+        s.system.addEventListener('notice', ({ pid, name, text }) => opts.onNotice({ pid, name, text }));
       }
     },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,
@@ -1077,6 +1096,12 @@ async function begin(opts, base, at, state, meter, lets) {
         desk.style.height = `${h}px`;
         desktop?.resizeOutput?.(w, h);
       } else {
+        // The canvas's CSS size too: the compositor sizes only its pixels,
+        // and a canvas keeps the size it was laid out at.
+        if (canvas) {
+          canvas.style.width = `${w}px`;
+          canvas.style.height = `${h}px`;
+        }
         sys?.compositor?.resize?.(w, h);
       }
       return { w, h };
@@ -1238,7 +1263,11 @@ function launchBuild(m, at) {
       pieces,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
-      switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
+      // Units looked up only when the build has some: with none (every x86
+      // program on the JIT), each image a process maps cost a synchronous
+      // request for a unit that is not there -- an installer's
+      // vlc-cache-gen.exe loading 365 plugins took 106 s for 25 s without.
+      switches: { ...((m.units ?? []).length ? { cgen: '1', cgenurl: at('project/build/web/units') } : {}), ...p },
     };
   }
   if (m.unsupported) throw new Error(`gex-eject: this project has no web build: ${m.unsupported}`);
