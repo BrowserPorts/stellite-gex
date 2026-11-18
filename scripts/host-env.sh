@@ -7,7 +7,9 @@
 # run by hand is run from bash after `. scripts/host-env.sh`.
 #
 #   GEX_BUILD        this checkout's build folder on the case-sensitive volume (default:
-#                    the folder target/ links into), with out/, work/ and tmp/ beside it
+#                    the folder target/'s own link names, followed one step: target/ there
+#                    may link on to another volume, as cargo's output has no case-only
+#                    pairs), with out/, work/ and tmp/ beside it
 #   GEX_SHARED       what every checkout on the host shares, as a Linux host shares
 #                    ~/.cache/gex and ~/emsdk (default: shared/ beside GEX_BUILD): cache/
 #                    (CACHE), emsdk/, py/, mingw/, seeds/ and xdg-cache/
@@ -32,8 +34,12 @@ gex_host_env() {
 
     if [ -n "$GEX_BUILD" ]; then
         build=$GEX_BUILD
+    elif [ -L "$root/target" ]; then
+        d=$(readlink "$root/target")
+        case $d in /*) ;; *) d=$root/$d ;; esac
+        build=$(cd "$(dirname "$d")" && pwd -P)
     elif [ -d "$root/target" ]; then
-        build=$(dirname "$(cd "$root/target" && pwd -P)")
+        build=$root
     else
         echo "host-env: target/ is missing: link it into the build volume or set GEX_BUILD" >&2
         return 1
@@ -103,5 +109,8 @@ elif [ -z "$GEX_HOST_ENV" ]; then
     if gex_host_env; then
         for v in $GEX_HOST_VARS; do export "$v"; done
         export PATH=$GEX_PATH:$PATH
+    else
+        # Sourced, the caller sees the failure; run, it exits with it.
+        return 1 2>/dev/null || exit 1
     fi
 fi
