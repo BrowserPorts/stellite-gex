@@ -12,6 +12,8 @@ gex-atomic.workspace = true
 gex-f80.workspace = true
 # PE parsing and mapping for the NT personality.
 gex-ld.workspace = true
+# The block store's format and allocator, shared with the page's offline editor.
+gex-store.workspace = true
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.

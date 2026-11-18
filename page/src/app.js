@@ -32,6 +32,7 @@ import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../hosts/browser/js/page-host.mjs';
 import { claimStore, storeBusy } from '../../hosts/browser/js/blocks.mjs';
 import { checkOptions, filesystemValue, sizeValue, showValue } from './start-options.js';
+import { INTERNAL } from '../runtime/src/internal.js';
 import { posixTz } from './posix-tz.js';
 import { mesaSource } from './mesa-source.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
@@ -53,7 +54,13 @@ const PIECES = {
 /**
  * Start the program. Resolves once it is running, with a handle:
  *   exited    a promise of the exit status (rejects if the run fails)
- *   kill()    stop it now (`exited` resolves 137)
+ *   kill({sync})  stop it now (`exited` resolves 137), once what was written
+ *             has gone to the filesystem's store or `sync` ms (default 5000;
+ *             0: not waited for) have passed; resolves then
+ *   sync()    what was written made durable in the filesystem's store now
+ *             (rejects with the store's error: EIO, ENOSPC)
+ *   fs        the run's filesystem (page/runtime fs.js: readFile, writeFile,
+ *             readdir, rm, ...) until the run stops, else null
  *   resize(size)  the desktop's new size: 'fit' (the container's) or {w, h}
  *   state     what a driver reads (phase, out, error, session, progress, ...)
  *   describe()    the desktop's windows, titles and pixels
@@ -1035,11 +1042,32 @@ async function begin(opts, base, at, state, meter, lets) {
   return {
     exited,
     state,
-    kill() {
+    async kill({ sync = 5000 } = {}) {
       if (state.phase === 'done' || state.phase === 'failed') return;
-      sys?.system.shutdown().catch(() => {});
+      // What the program wrote goes to the store first, for as long as
+      // `sync` allows: a tab closed right after keeps it.
+      const s = sys?.system;
+      if (s && sync > 0 && s.state.phase === 'running') {
+        let timer;
+        await Promise.race([s.sync().catch(() => {}), new Promise((r) => { timer = setTimeout(r, sync); })]);
+        clearTimeout(timer);
+      }
+      s?.shutdown().catch(() => {});
       globalThis.__gexSystemWorker?.terminate?.();
       settle(137);
+    },
+    /** The run's files made durable in its store (System.sync). */
+    async sync() {
+      const s = sys?.system;
+      if (!s) throw new Error('sync(): the run has no system yet');
+      await s.sync();
+    },
+    /** The run's filesystem (fs.js), from when its system is made until it
+     *  stops (its files are read and written once the system runs). */
+    get fs() {
+      const s = sys?.system;
+      const over = state.phase === 'done' || state.phase === 'failed' || s?.state.phase === 'stopped' || s?.state.phase === 'failed';
+      return s && !over ? s[INTERNAL].part('filesystem') : null;
     },
     resize(size = 'fit') {
       if (!sizeValue(size)) throw new Error(`resize(${showValue(size)}): 'fit', {w, h} or 'WxH', in pixels`);
