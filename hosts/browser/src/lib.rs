@@ -765,10 +765,24 @@ fn slot_space_top() -> u64 {
 static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64, String)>> =
     SingleThreaded(RefCell::new(Vec::new()));
 
+/// The map [`IDENT_SNAPSHOT`] was taken from, as its view (one per map for the
+/// map's life, a copied map's its own) and its generation: equal, the map has
+/// not changed since, and neither has the snapshot. Holding the view keeps
+/// its address from naming another map.
+static IDENT_SNAPSHOT_OF: SingleThreaded<Option<(std::sync::Arc<gex_kernel::mem::MapView>, u64)>> =
+    SingleThreaded(RefCell::new(None));
+
 fn refresh_ident_snapshot(p: &Px<'_>) {
     use std::hash::Hash;
+    let mm = p.mm.lock();
+    let at = (mm.view(), mm.generation());
+    if let Some((view, generation)) = IDENT_SNAPSHOT_OF.0.borrow().as_ref() {
+        if std::sync::Arc::ptr_eq(view, at.0) && *generation == at.1 {
+            return;
+        }
+    }
     let mut snap = Vec::new();
-    for v in p.mm.lock().vmas().iter() {
+    for v in mm.vmas().iter() {
         if v.prot & gex_kernel::mem::prot::WRITE != 0 {
             continue;
         }
@@ -778,6 +792,7 @@ fn refresh_ident_snapshot(p: &Px<'_>) {
         snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
+    *IDENT_SNAPSHOT_OF.0.borrow_mut() = Some((std::sync::Arc::clone(at.0), at.1));
 }
 
 /// `page_identity` for a page number, from the snapshot, with the object id
@@ -787,7 +802,9 @@ fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     let alt = page & gex_abi::ALT_PAGE != 0;
     let addr = (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
     let snap = IDENT_SNAPSHOT.0.borrow();
-    let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
+    // The mappings in address order, as the map keeps them.
+    let i = snap.partition_point(|(s, _, _, _, _)| *s <= addr);
+    let (start, _, hasher, off, id) = snap[..i].last().filter(|(_, e, _, _, _)| addr < *e)?;
     let mut hs = hasher.clone();
     (off + (addr - start)).hash(&mut hs);
     // A page key of the other mode is `key_identity`'s, whole.
@@ -18278,15 +18295,17 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // How many of this unit's pages could be named: `noident` counts only
         // the miss path, so a page identifiable at fault but not at store time
         // is invisible, and the store happens here.
+        // Counted only for the message: a lookup per covered page on every
+        // store otherwise.
         {
-            let total = unit.covered.len();
-            let named = unit
-                .covered
-                .iter()
-                .filter(|(pg, _)| key_identity(px, *pg).is_some())
-                .count();
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if tracing() && NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                let total = unit.covered.len();
+                let named = unit
+                    .covered
+                    .iter()
+                    .filter(|(pg, _)| key_identity(px, *pg).is_some())
+                    .count();
                 warn_line(&format!(
                     "[gex] storing a unit: {named} of {total} pages can be named\n"
                 ));
