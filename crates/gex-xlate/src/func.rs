@@ -522,11 +522,12 @@ pub struct Materializer<'a> {
 }
 
 impl<'a> Materializer<'a> {
-    /// For the functions [`recover_pe_shaped`] recovered from `image` with
-    /// `opts`. Used on the thread that recovered them, or one in the same
-    /// mode ([`crate::set_thread_compat`]).
-    pub fn new(image: &'a Image, opts: &RecoverOptions) -> Materializer<'a> {
-        Materializer { code: Code::with_elf(image, None), limits: opts.limits }
+    /// For the functions [`recover_pe_shaped`] (`elf` `None`) or
+    /// [`recover_shaped`] (the same `elf`) recovered from `image` with `opts`.
+    /// Used on the thread that recovered them, or one in the same mode
+    /// ([`crate::set_thread_compat`]).
+    pub fn new(image: &'a Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Materializer<'a> {
+        Materializer { code: Code::with_elf(image, elf), limits: opts.limits }
     }
 
     /// `f` with its statements.
@@ -1027,6 +1028,14 @@ pub(crate) fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bo
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
+    let code = Code::with_elf(image, elf);
+    let prog = recover_shaped(image, elf, opts);
+    whole(&code, opts, prog)
+}
+
+/// [`recover`] whose functions are block shapes, as [`recover_pe_shaped`]'s
+/// are; [`Materializer`] gives a function its statements.
+pub fn recover_shaped(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
     // i386 code decodes in compatibility mode: this thread's setting until
     // its next image, which summaries read back ([`arch::compat`]).
     crate::set_thread_compat(image.class32);
@@ -1041,7 +1050,7 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
     }
     let code = Code::with_elf(image, elf);
     let (starts, fdes) = seeds(&code, elf, opts.scan_data);
-    whole(&code, opts, recover_seeded(&code, starts, fdes, opts))
+    recover_seeded(&code, starts, fdes, opts)
 }
 
 /// A shaped recovery's functions with their statements.

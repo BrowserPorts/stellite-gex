@@ -457,9 +457,24 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>, RegSet, 
 /// what codegen needs of `sums` to `dir`, atomically. `class32` is part of
 /// the record: the emitted C depends on it.
 pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summary>, class32: bool) -> Result<()> {
-    let trapfree = func::trap_free(funcs, sums);
-    let touched = func::touched(funcs);
-    let guardfree = func::guard_free(funcs, sums);
+    write_recovery_by(dir, funcs, &|f| Ok(std::borrow::Cow::Borrowed(f)), sums, class32)
+}
+
+/// [`write_recovery`] for functions whose statements `ir` gives, one at a
+/// time: block shapes from a shaped recovery
+/// (`gex_xlate::func::recover_pe_shaped`). Each function is written as it
+/// comes, keeping only what the whole-image facts ([`func::trap_free`],
+/// [`func::touched`], [`func::guard_free`]) need of it, so an image of any
+/// size is written with one function's statements in memory.
+pub fn write_recovery_by<'f>(
+    dir: &Path,
+    funcs: &'f [Function],
+    ir: &dyn Fn(&'f Function) -> Result<std::borrow::Cow<'f, Function>>,
+    sums: &HashMap<u64, Summary>,
+    class32: bool,
+) -> Result<()> {
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let is_known = |t: u64| known.contains(&t);
     let parent = dir.parent().ok_or_else(|| anyhow!("{} has no parent", dir.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -469,6 +484,29 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
+    let mut touched_local = Vec::with_capacity(funcs.len());
+    let mut guard_local = Vec::with_capacity(funcs.len());
+    let mut trap_cand = HashMap::new();
+    {
+        let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
+        writeln!(gir, "{FORMAT}")?;
+        for f in funcs {
+            let f = ir(f)?;
+            let weight = func::frame_weight(&func::registers(&f));
+            touched_local.push((f.entry, func::touched_local(&f, &is_known)));
+            guard_local.push((f.entry, func::guard_free_local(&f, &is_known, sums, weight)));
+            if let Some(c) = func::trap_free_local(&f, &is_known, sums, &|| weight) {
+                trap_cand.insert(f.entry, c);
+            }
+            let text = gex_ir::text::print(&f);
+            writeln!(gir, "## {:x} {}", f.entry, text.len())?;
+            gir.write_all(text.as_bytes())?;
+        }
+        gir.flush()?;
+    }
+    let trapfree = func::trap_free_of(&trap_cand);
+    let touched = func::touched_of(&touched_local);
+    let guardfree = func::guard_free_of(&guard_local);
     {
         let mut meta = BufWriter::new(std::fs::File::create(tmp.join("summaries"))?);
         writeln!(meta, "{FORMAT}")?;
@@ -479,14 +517,6 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
             meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied(), t, guardfree.contains(&f.entry)).as_bytes())?;
         }
         meta.flush()?;
-        let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
-        writeln!(gir, "{FORMAT}")?;
-        for f in funcs {
-            let text = gex_ir::text::print(f);
-            writeln!(gir, "## {:x} {}", f.entry, text.len())?;
-            gir.write_all(text.as_bytes())?;
-        }
-        gir.flush()?;
     }
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir).with_context(|| format!("moving the recovery into {}", dir.display()))?;

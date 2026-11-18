@@ -2057,42 +2057,57 @@ pub fn flags_abi() -> bool {
 /// that reaches code outside `funcs`, an indirect transfer or a clobbering
 /// host call names everything.
 pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
-    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
-    let mut local = vec![RegSet::EMPTY; funcs.len()];
-    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
-    for (k, f) in funcs.iter().enumerate() {
-        let mut l = RegSet::EMPTY;
-        for b in &f.blocks {
-            for s in &b.stmts {
-                match s {
-                    Stmt::WriteReg { reg, .. } => l.insert(*reg),
-                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
-                    // A host helper may read or write any register in the
-                    // context (x87, fxsave, cpuid), and a trap reads them all.
-                    Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } => l = RegSet::ALL,
-                    _ if emit::clobbers(s) => l = RegSet::ALL,
-                    _ => {}
-                }
-            }
-            match &b.term {
-                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
-                    Some(&c) => callees[k].push(c),
-                    None => l = RegSet::ALL,
-                },
-                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } | FTerm::Syscall { .. } => l = RegSet::ALL,
-                FTerm::Switch { table, .. } if !table.complete => l = RegSet::ALL,
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let local: Vec<(u64, (RegSet, Vec<u64>))> = funcs.iter().map(|f| (f.entry, touched_local(f, &|t| known.contains(&t)))).collect();
+    touched_of(&local)
+}
+
+/// [`touched`]'s fact about one function: the registers it names itself,
+/// and its direct callees among the functions `known` says are there (a call
+/// to any other names everything).
+pub fn touched_local(f: &Function, known: &dyn Fn(u64) -> bool) -> (RegSet, Vec<u64>) {
+    let mut l = RegSet::EMPTY;
+    let mut callees = Vec::new();
+    for b in &f.blocks {
+        for s in &b.stmts {
+            match s {
+                Stmt::WriteReg { reg, .. } => l.insert(*reg),
+                Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                // A host helper may read or write any register in the
+                // context (x87, fxsave, cpuid), and a trap reads them all.
+                Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } => l = RegSet::ALL,
+                _ if emit::clobbers(s) => l = RegSet::ALL,
                 _ => {}
             }
         }
-        local[k] = l;
+        match &b.term {
+            FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => {
+                if known(*t) {
+                    callees.push(*t);
+                } else {
+                    l = RegSet::ALL;
+                }
+            }
+            FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } | FTerm::Syscall { .. } => l = RegSet::ALL,
+            FTerm::Switch { table, .. } if !table.complete => l = RegSet::ALL,
+            _ => {}
+        }
     }
-    let mut t = local.clone();
+    (l, callees)
+}
+
+/// [`touched`] from each function's [`touched_local`], in the functions'
+/// order.
+pub fn touched_of(local: &[(u64, (RegSet, Vec<u64>))]) -> HashMap<u64, RegSet> {
+    let idx: HashMap<u64, usize> = local.iter().enumerate().map(|(k, (e, _))| (*e, k)).collect();
+    let callees: Vec<Vec<usize>> = local.iter().map(|(_, (_, c))| c.iter().map(|t| idx[t]).collect()).collect();
+    let mut t: Vec<RegSet> = local.iter().map(|(_, (l, _))| *l).collect();
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
-        for k in 0..funcs.len() {
+        for k in 0..local.len() {
             let mut v = t[k];
             for &c in &callees[k] {
                 v = v.union(t[c]);
@@ -2106,7 +2121,7 @@ pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
     if changed {
         return HashMap::new();
     }
-    funcs.iter().enumerate().map(|(k, f)| (f.entry, t[k])).collect()
+    local.iter().enumerate().map(|(k, (e, _))| (*e, t[k])).collect()
 }
 
 /// `GEX_CGEN_WB_BISECT=N`: the minimal write-back at the first N call
@@ -2126,24 +2141,42 @@ static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// trap-free tree must. The guard stays where a call chain can grow
 /// without bound.
 pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u64> {
-    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
-    let mut cand: Vec<Option<(u32, Vec<usize>)>> = Vec::with_capacity(funcs.len());
-    for f in funcs {
-        let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
-        let mut callees = Vec::new();
-        let mut bad = !ok;
-        for b in &f.blocks {
-            match &b.term {
-                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
-                    Some(&c) => callees.push(c),
-                    None => bad = true,
-                },
-                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
-                _ => {}
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let local: Vec<(u64, Option<(u32, Vec<u64>)>)> =
+        funcs.iter().map(|f| (f.entry, guard_free_local(f, &|t| known.contains(&t), sums, frame_weight(&registers(f))))).collect();
+    guard_free_of(&local)
+}
+
+/// [`guard_free`]'s fact about one function: `None` when it calls anything
+/// but the functions `known` says are there, or its summary says it may
+/// unwind or reach an unknown callee; else its frame's `weight`
+/// ([`frame_weight`]) and its direct callees.
+pub fn guard_free_local(f: &Function, known: &dyn Fn(u64) -> bool, sums: &HashMap<u64, Summary>, weight: u32) -> Option<(u32, Vec<u64>)> {
+    let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
+    let mut callees = Vec::new();
+    let mut bad = !ok;
+    for b in &f.blocks {
+        match &b.term {
+            FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => {
+                if known(*t) {
+                    callees.push(*t);
+                } else {
+                    bad = true;
+                }
             }
+            FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
+            _ => {}
         }
-        cand.push((!bad).then(|| (frame_weight(&registers(f)), callees)));
     }
+    (!bad).then(|| (weight, callees))
+}
+
+/// [`guard_free`] from each function's [`guard_free_local`], in the
+/// functions' order.
+pub fn guard_free_of(local: &[(u64, Option<(u32, Vec<u64>)>)]) -> HashSet<u64> {
+    let idx: HashMap<u64, usize> = local.iter().enumerate().map(|(k, (e, _))| (*e, k)).collect();
+    let cand: Vec<Option<(u32, Vec<usize>)>> =
+        local.iter().map(|(_, c)| c.as_ref().map(|(w, callees)| (*w, callees.iter().map(|t| idx[t]).collect()))).collect();
     // Depth-first, memoised; a cycle (recursion) fails every function on it.
     fn visit(k: usize, cand: &[Option<(u32, Vec<usize>)>], memo: &mut [Option<Option<u32>>], onstack: &mut [bool]) -> Option<u32> {
         if let Some(m) = memo[k] {
@@ -2164,12 +2197,12 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
         memo[k] = Some(r);
         r
     }
-    let mut memo = vec![None; funcs.len()];
-    let mut onstack = vec![false; funcs.len()];
+    let mut memo = vec![None; local.len()];
+    let mut onstack = vec![false; local.len()];
     let mut out = HashSet::new();
-    for k in 0..funcs.len() {
+    for k in 0..local.len() {
         if visit(k, &cand, &mut memo, &mut onstack).is_some() {
-            out.insert(funcs[k].entry);
+            out.insert(local[k].0);
         }
     }
     out
@@ -2326,43 +2359,62 @@ pub fn guest_insns(f: &Function) -> usize {
 /// hold dead in locals are never seen by anyone. Its subtree must fit in
 /// `TRAPFREE_RESERVE`, since it has no depth guard.
 pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u64, u32> {
-    let by_entry: HashMap<u64, &Function> = funcs.iter().map(|f| (f.entry, f)).collect();
-    // Local conditions, and the direct callees.
-    let mut cand: HashMap<u64, (u32, Vec<u64>)> = HashMap::new();
-    'f: for f in funcs {
-        let Some(sm) = sums.get(&f.entry) else { continue };
-        if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee {
-            continue;
-        }
-        let mut callees = Vec::new();
-        for b in &f.blocks {
-            if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. })) {
-                continue 'f;
-            }
-            let backward = |e: &Edge| {
-                let to = &f.blocks[e.to.index()];
-                !to.synthetic && to.start <= b.start
-            };
-            match &b.term {
-                FTerm::Jump(e) if !backward(e) => {}
-                FTerm::Branch {
-                    taken, not_taken, ..
-                } if !backward(taken) && !backward(not_taken) => {}
-                FTerm::Switch { cases, table, .. }
-                    if table.complete && !cases.iter().any(|(_, e)| backward(e)) => {}
-                FTerm::Call {
-                    callee: Callee::Direct(t),
-                    ret: Some(r),
-                    ..
-                } if by_entry.contains_key(t) && !backward(r) => callees.push(*t),
-                FTerm::Return { .. } => {}
-                _ => continue 'f,
-            }
-        }
-        cand.insert(f.entry, (frame_weight(&registers(f)), callees));
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let cand: HashMap<u64, (u32, Vec<u64>)> = funcs
+        .iter()
+        .filter_map(|f| Some((f.entry, trap_free_local(f, &|t| known.contains(&t), sums, &|| frame_weight(&registers(f)))?)))
+        .collect();
+    trap_free_of(&cand)
+}
+
+/// [`trap_free`]'s fact about one function: its frame's weight
+/// (`weight`, [`frame_weight`]) and its direct callees, when its own code
+/// can neither trap, clobber, loop nor call anything but the functions
+/// `known` says are there, and its summary says it cannot unwind, leave
+/// pending or reach an unknown callee.
+pub fn trap_free_local(
+    f: &Function,
+    known: &dyn Fn(u64) -> bool,
+    sums: &HashMap<u64, Summary>,
+    weight: &dyn Fn() -> u32,
+) -> Option<(u32, Vec<u64>)> {
+    let sm = sums.get(&f.entry)?;
+    if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee {
+        return None;
     }
-    // Callees trap-free too, no recursion, bounded stack: a depth-first
-    // walk that memoises the subtree's stack and treats a cycle as failure.
+    let mut callees = Vec::new();
+    for b in &f.blocks {
+        if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. })) {
+            return None;
+        }
+        let backward = |e: &Edge| {
+            let to = &f.blocks[e.to.index()];
+            !to.synthetic && to.start <= b.start
+        };
+        match &b.term {
+            FTerm::Jump(e) if !backward(e) => {}
+            FTerm::Branch {
+                taken, not_taken, ..
+            } if !backward(taken) && !backward(not_taken) => {}
+            FTerm::Switch { cases, table, .. }
+                if table.complete && !cases.iter().any(|(_, e)| backward(e)) => {}
+            FTerm::Call {
+                callee: Callee::Direct(t),
+                ret: Some(r),
+                ..
+            } if known(*t) && !backward(r) => callees.push(*t),
+            FTerm::Return { .. } => {}
+            _ => return None,
+        }
+    }
+    Some((weight(), callees))
+}
+
+/// [`trap_free`] from the functions' [`trap_free_local`] facts: callees
+/// trap-free too, no recursion, bounded stack.
+pub fn trap_free_of(cand: &HashMap<u64, (u32, Vec<u64>)>) -> HashMap<u64, u32> {
+    // A depth-first walk that memoises the subtree's stack and treats a
+    // cycle as failure.
     fn visit(
         a: u64,
         cand: &HashMap<u64, (u32, Vec<u64>)>,
@@ -2390,7 +2442,7 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
     let mut onstack = HashSet::new();
     let keys: Vec<u64> = cand.keys().copied().collect();
     for a in keys {
-        visit(a, &cand, &mut memo, &mut onstack);
+        visit(a, cand, &mut memo, &mut onstack);
     }
     memo.into_iter().filter_map(|(a, n)| n.map(|n| (a, n))).collect()
 }
