@@ -780,6 +780,13 @@ impl FnUnit {
             self.no_devirt.clear();
             f
         };
+        let pruned;
+        let f = if dead_flags() {
+            pruned = drop_dead_flags(f, sums, &self.zf_calls);
+            &pruned
+        } else {
+            f
+        };
         let dummy = Block::new(f.entry);
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
@@ -1990,41 +1997,9 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
         changed = false;
         for &i in &order {
             let b = &f.blocks[i];
-            let mut l = match &b.term {
-                FTerm::Jump(e) => live[e.to.index()],
-                FTerm::Branch {
-                    taken, not_taken, ..
-                } => live[taken.to.index()].union(live[not_taken.to.index()]),
-                // The default case leaves.
-                FTerm::Switch { .. } => RegSet::ALL,
-                FTerm::Call {
-                    callee: Callee::Direct(t),
-                    ret: Some(r),
-                    ..
-                } => match sums.get(t) {
-                    Some(sm) => sm.inputs.union(live[r.to.index()]),
-                    None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
-                    None => RegSet::ALL,
-                },
-                // `flags_abi`: no callee reads the flags it is entered with.
-                FTerm::Call { ret, .. } if flags_abi() => {
-                    call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
-                }
-                FTerm::TailCall { .. } if flags_abi() => non_flags(),
-                _ => RegSet::ALL,
-            };
+            let mut l = exit_live(b, &live, sums, zf);
             for s in b.stmts.iter().rev() {
-                match s {
-                    Stmt::WriteReg { reg, .. } => l.remove(*reg),
-                    Stmt::Def {
-                        expr: Expr::ReadReg(r),
-                        ..
-                    } => l.insert(*r),
-                    // A trap reads everything (on its faulting path).
-                    Stmt::Trap { .. } => l = RegSet::ALL,
-                    _ if emit::clobbers(s) => l = RegSet::ALL,
-                    _ => {}
-                }
+                live_step(s, &mut l);
             }
             if l != live[i] {
                 live[i] = l;
@@ -2033,6 +2008,160 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
         }
     }
     live
+}
+
+/// What [`live_in_with`] takes to be live at the end of `b`, from the
+/// blocks' live-in sets `live`: what its successors read, or what its exit
+/// reads.
+fn exit_live(b: &FBlock, live: &[RegSet], sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> RegSet {
+    match &b.term {
+        FTerm::Jump(e) => live[e.to.index()],
+        FTerm::Branch {
+            taken, not_taken, ..
+        } => live[taken.to.index()].union(live[not_taken.to.index()]),
+        // The default case leaves.
+        FTerm::Switch { .. } => RegSet::ALL,
+        FTerm::Call {
+            callee: Callee::Direct(t),
+            ret: Some(r),
+            ..
+        } => match sums.get(t) {
+            Some(sm) => sm.inputs.union(live[r.to.index()]),
+            None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
+            None => RegSet::ALL,
+        },
+        // `flags_abi`: no callee reads the flags it is entered with.
+        FTerm::Call { ret, .. } if flags_abi() => {
+            call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+        }
+        FTerm::TailCall { .. } if flags_abi() => non_flags(),
+        _ => RegSet::ALL,
+    }
+}
+
+/// [`live_in_with`]'s step back over one statement: `l`, live after `s`,
+/// becomes what is live before it.
+fn live_step(s: &Stmt, l: &mut RegSet) {
+    match s {
+        Stmt::WriteReg { reg, .. } => l.remove(*reg),
+        Stmt::Def {
+            expr: Expr::ReadReg(r),
+            ..
+        } => l.insert(*r),
+        // A trap reads everything (on its faulting path).
+        Stmt::Trap { .. } => *l = RegSet::ALL,
+        _ if emit::clobbers(s) => *l = RegSet::ALL,
+        _ => {}
+    }
+}
+
+/// Whether [`drop_dead_flags`] runs: with liveness-limited write-backs
+/// ([`live_writebacks`]), unless `GEX_CGEN_EXP=KEEPDEADFLAGS` (for pricing
+/// and bisecting; not in the unit key: use a private cache).
+pub fn dead_flags() -> bool {
+    live_writebacks() && !exp("KEEPDEADFLAGS")
+}
+
+/// `f` without the flag writes [`live_in_with`] proves dead (no path from
+/// the write reads the flag before writing it again, and every exit the
+/// function does not see past, trap and clobbering host call reads it), and
+/// without the pure definitions only they used, to a fixpoint. Nothing
+/// observes such a write: write-backs are limited to what that liveness
+/// says is live, a memory fault traps out with the state of the last
+/// write-back, and a trap or clobbering host call reads every flag. So the
+/// C is the same program, without code clang would have deleted after
+/// reading it: the lifter writes every flag of every instruction, most of
+/// a function's statements. Tier-1 drops the same writes
+/// (`gex_xlate`'s `eliminate_dead_flags`).
+pub fn drop_dead_flags(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> Function {
+    let mut g = f.clone();
+    loop {
+        let live = live_in_with(&g, sums, zf);
+        let mut changed = false;
+        for i in 0..g.blocks.len() {
+            let mut l = exit_live(&g.blocks[i], &live, sums, zf);
+            let b = &g.blocks[i];
+            let mut drop = vec![false; b.stmts.len()];
+            for (k, s) in b.stmts.iter().enumerate().rev() {
+                if let Stmt::WriteReg { reg, .. } = s {
+                    if reg.is_flag() && !l.contains(*reg) {
+                        drop[k] = true;
+                        continue;
+                    }
+                }
+                live_step(s, &mut l);
+            }
+            if drop.iter().any(|&d| d) {
+                retain_stmts(&mut g.blocks[i], &drop);
+                changed = true;
+            }
+        }
+        changed |= drop_unused_defs(&mut g);
+        if !changed {
+            return g;
+        }
+    }
+}
+
+/// Drop `b`'s statements where `drop` is set, and their `pcs`.
+fn retain_stmts(b: &mut FBlock, drop: &[bool]) {
+    let mut k = 0;
+    b.stmts.retain(|_| {
+        k += 1;
+        !drop[k - 1]
+    });
+    let mut k = 0;
+    b.pcs.retain(|_| {
+        k += 1;
+        !drop[k - 1]
+    });
+}
+
+/// Delete the pure definitions (and x87 operations) no statement,
+/// terminator or edge of `f` uses, as `gex_ir::pass::dce` does for a block,
+/// over the whole function's values. Whether anything was deleted.
+fn drop_unused_defs(f: &mut Function) -> bool {
+    let mut any = false;
+    loop {
+        let mut used = vec![false; f.n_values as usize];
+        let mut mark = |v: gex_ir::Value| {
+            if let Some(u) = used.get_mut(v.0 as usize) {
+                *u = true;
+            }
+        };
+        for b in &f.blocks {
+            for s in &b.stmts {
+                s.for_each_use(&mut mark);
+            }
+            b.term.for_each_use(&mut mark);
+            for e in b.term.edges() {
+                for &v in &e.args {
+                    mark(v);
+                }
+            }
+        }
+        let unused = |v: &gex_ir::Value| !used.get(v.0 as usize).copied().unwrap_or(true);
+        let mut changed = false;
+        for b in f.blocks.iter_mut() {
+            let drop: Vec<bool> = b
+                .stmts
+                .iter()
+                .map(|s| match s {
+                    Stmt::Def { dst, expr } => expr.is_pure() && unused(dst),
+                    Stmt::X87 { outs, .. } => outs.iter().all(unused),
+                    _ => false,
+                })
+                .collect();
+            if drop.iter().any(|&d| d) {
+                retain_stmts(b, &drop);
+                changed = true;
+            }
+        }
+        if !changed {
+            return any;
+        }
+        any = true;
+    }
 }
 
 /// Every register but the flags.
