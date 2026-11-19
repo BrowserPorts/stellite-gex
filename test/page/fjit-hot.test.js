@@ -1,10 +1,11 @@
 // The function JIT's hot tier (fjit.rs, `?fjit=hot`): tier-1 runs a program
 // first, the safepoint's samples find its loops hot, and the JIT translates
-// them, on a helper Worker of the process (`hot`) or on the thread that
-// sampled them (`hotsync`); the thread goes into each JIT function at its
-// next sample there. fixtures/programs/fjit-hot.c's rounds must print what
-// they print on tier-1 alone, and the JIT must have taken hot roots: the
-// helper's, translated and compiled there and published, under `hot`.
+// the functions around them (an ELF object's `.eh_frame` bounds them), on a
+// helper Worker of the process (`hot`) or on the thread that sampled them
+// (`hotsync`); the next round calls the JIT functions.
+// fixtures/programs/fjit-hot.c's rounds must print what they print on tier-1
+// alone, and the JIT must have taken hot roots: the helper's, translated and
+// compiled there and published, under `hot`.
 import { guest, tail } from '../lib/guest.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 900 };
