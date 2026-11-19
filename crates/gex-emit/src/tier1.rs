@@ -1116,6 +1116,22 @@ impl<'a> Emitter<'a> {
             for r in reads {
                 self.reg_local(r);
             }
+            // Every register the body writes is held in its local from the
+            // loop's head, and counts as dirty there: an earlier iteration
+            // may have written it after a point where this one faults (a
+            // post-indexed store's base, written after the store), and a
+            // fault path writes back only what is dirty. The emitter sees
+            // the body once, so at a fault before the write it would think
+            // the register clean, and the handler would see the value from
+            // before the loop; the retry then stores to the wrong place.
+            let mut writes = written_registers(block);
+            writes.sort_by_key(|r| Self::reg_offset(*r));
+            for r in writes {
+                self.reg_local(r);
+                if let Some(c) = self.regs.get_mut(&r) {
+                    c.dirty = true;
+                }
+            }
             let counter = self.alloc(Ty::I32);
             self.f.i32_const(loop_poll());
             self.f.local_set(counter);
@@ -6054,6 +6070,19 @@ pub fn clobbers_guest_state(s: &Stmt) -> bool {
 /// context is left stale inside it. A register written before reading needs no
 /// preload, and leaving it out matters: every preloaded register stays live
 /// across the whole loop, costing the host's allocator a machine register.
+/// The registers `block`'s statements write, once each, in order.
+fn written_registers(block: &Block) -> Vec<GuestReg> {
+    let mut written = Vec::new();
+    for s in &block.stmts {
+        if let Stmt::WriteReg { reg, .. } = s {
+            if !written.contains(reg) {
+                written.push(*reg);
+            }
+        }
+    }
+    written
+}
+
 fn live_in_registers(block: &Block) -> Vec<GuestReg> {
     let mut live_in = Vec::new();
     let mut written = Vec::new();
