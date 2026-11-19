@@ -744,8 +744,10 @@ fn publish_made(n: u32, made: Made, later: bool) -> Option<u32> {
     }
     let n = TRANSLATED.fetch_add(1, Ordering::Relaxed) + 1;
     // The translator's line at 1024, 2048, ... translations: a process that
-    // never exits (a game) reports too.
-    if n >= 1024 && n.is_power_of_two() {
+    // never exits (a game) reports too. The hot tier translates only what
+    // runs hot, a few dozen functions where the first-miss JIT makes
+    // thousands, so it reports from 16 on.
+    if n >= if hot() { 16 } else { 1024 } && n.is_power_of_two() {
         gex_fjit_report();
     }
     let idx = crate::cgen::index_of(addr);
@@ -1240,9 +1242,14 @@ pub extern "C" fn gex_fjit_installed(n: u32) {
 
 /// The translator's line (`gex_xlate::fjit::Jit::stats`: modules, time,
 /// and how often its lock was found held), for the host to print as the
-/// process ends.
+/// process ends. Not for a process the JIT did nothing in (no translation,
+/// no hot root): every short-lived helper of Wine's printed a line of
+/// zeros, on the console's error level.
 #[no_mangle]
 pub extern "C" fn gex_fjit_report() {
+    if TRANSLATED.load(Ordering::Relaxed) == 0 && PROMOTED_LEN.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     if let (true, Some(jit)) = (on(), JIT.get()) {
         crate::warn_line(&format!(
             "[gex] fjit: {} (translated {}, declined {}{})\n",
