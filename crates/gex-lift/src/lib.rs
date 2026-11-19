@@ -139,7 +139,9 @@ struct AddResult {
 struct Address {
     base: Value,
     offset: i64,
-    /// Post-index writeback applied after the access. A `Value`, not a
+    /// Writeback (post-index, and pre-index too: the base register is
+    /// written only once the access has been made) applied after the
+    /// access: the register plus this. A `Value`, not a
     /// constant, because the register-offset form's amount is only known at
     /// run time.
     post: Option<(RegSel, Value)>,
@@ -479,9 +481,12 @@ impl<'a> Lifter<'a> {
 
     // -- addressing --------------------------------------------------------
 
-    /// Resolve an addressing mode into a base value plus a constant offset,
-    /// performing any pre-index base update. Post-index writeback is deferred
-    /// to [`Self::finish_address`] so it happens *after* the access.
+    /// Resolve an addressing mode into a base value plus a constant offset.
+    /// Writeback, pre-index and post-index alike, is deferred to
+    /// [`Self::finish_address`] so it happens *after* the access: an access
+    /// that faults leaves the base register as it was, and the handler's
+    /// retry (a userfaultfd page filled, a guard page grown) makes the same
+    /// access again. Updating it first moved the base twice on a retry.
     fn address(&mut self, addr: &AddrMode) -> Address {
         match *addr {
             AddrMode::Offset { rn, off } => {
@@ -496,11 +501,10 @@ impl<'a> Lifter<'a> {
                 let base = self.rd_addr(rn);
                 let delta = self.b.const_i64(off as u64);
                 let updated = self.b.bin(BinOp::Add, Ty::I64, base, delta);
-                self.wr_addr(rn, updated);
                 Address {
                     base: updated,
                     offset: 0,
-                    post: None,
+                    post: Some((rn, delta)),
                 }
             }
             AddrMode::PostIndex { rn, off } => {
