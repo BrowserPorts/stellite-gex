@@ -1,3 +1,4 @@
+import { fold, readAll, runKey, saveRun } from './wgsl-store.js';
 import { requestGexDevice } from './gpu-device.js';
 // The guest's GL device, backed by Mesa's frontend and the gex_wgpu Gallium
 // driver on the browser's WebGPU.
@@ -229,21 +230,6 @@ function quietReports(out, all) {
 }
 
 /** One IndexedDB store of shader-cache blobs, by Mesa glue URL. */
-function wgslDb(op, key, value) {
-  return new Promise((resolve, reject) => {
-    const open = indexedDB.open('gex-wgsl-cache', 1);
-    open.onupgradeneeded = () => open.result.createObjectStore('blobs');
-    open.onerror = () => reject(open.error);
-    open.onsuccess = () => {
-      const db = open.result;
-      const tx = db.transaction('blobs', op === 'get' ? 'readonly' : 'readwrite');
-      const req = op === 'get' ? tx.objectStore('blobs').get(key) : tx.objectStore('blobs').put(value, key);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-      tx.oncomplete = () => db.close();
-    };
-  });
-}
 
 export class MesaGlDevice {
   // The GPUAdapter and GPUDevice, held for the renderer's whole life and never
@@ -434,6 +420,8 @@ export class MesaGlDevice {
   // new translations are saved every few seconds while they keep coming.
   #wgslKey = null;
   #wgslSaved = 0;
+  /** This run's record of the cache (wgsl-store.js `runKey`). */
+  #wgslRun = null;
 
   /** `mode`: 'all' (the site's and this browser's), 'site' (the site's
    *  only, nothing kept: bench runs, whose profile outlives a run), '0'. */
@@ -458,9 +446,14 @@ export class MesaGlDevice {
       this.#wgslKey = null;
       return;
     }
+    // The base and every earlier run's own translations (wgsl-store.js); runs' records are
+    // folded into a new base here, once, so a run never rewrites the whole cache while it plays.
     try {
-      load(await wgslDb('get', this.#wgslKey), 'this browser');
+      const records = await readAll(this.#wgslKey);
+      for (const [, blob] of records) load(blob, 'this browser');
+      if (records.some(([k]) => k !== this.#wgslKey)) await fold(this.#wgslKey, this.wgslCache());
     } catch { /* no IndexedDB here */ }
+    this.#wgslRun = runKey(this.#wgslKey);
     const timer = setInterval(() => this.#saveWgslCache(), 5000);
     (globalThis.__gexWgslTimers ||= []).push(timer);
   }
@@ -490,12 +483,15 @@ export class MesaGlDevice {
     return { hits, misses, loaded, held };
   }
 
+  /** What this run has translated (Mesa's fresh entries), as this run's record, when it has
+   *  translated more since the last save. */
   async #saveWgslCache() {
     const st = this.wgslStats();
-    if (!this.#wgslKey || !st || st.misses === this.#wgslSaved) return;
+    if (!this.#wgslKey || !this.#wgslRun || !st || st.misses === this.#wgslSaved) return;
     this.#wgslSaved = st.misses;
     try {
-      await wgslDb('put', this.#wgslKey, this.wgslCache());
+      const fresh = this.wgslCache(true);
+      if (fresh) await saveRun(this.#wgslRun, fresh);
     } catch { /* best effort */ }
   }
 
