@@ -340,11 +340,24 @@ fn loads(elf: &[u8]) -> Vec<(u64, u64, u64)> {
 /// `_xcb_in_read_block`, a memmove of -8 bytes). The fallback runs it
 /// instead; the function's real entry still gets translated.
 fn mid_function(addr: u64) -> bool {
+    let Some((name, x, _)) = enclosing(addr) else { return false };
+    let n = MID_DECLINED.fetch_add(1, Ordering::Relaxed);
+    // Routine (a start the JIT declines; the fallback runs it), so only
+    // with each translation traced: `fjit=2`.
+    if TRACE.load(Ordering::Relaxed) && (n < 32 || (n + 1).is_power_of_two()) {
+        crate::warn_line(&format!("[fjit] {addr:#x} ({name} +{x:#x}) is inside a function: left to the fallback ({} so far)\n", n + 1));
+    }
+    true
+}
+
+/// The function `addr` lies strictly inside, by its object's `.eh_frame`:
+/// the object's file name, `addr` in the file's addresses, and the
+/// function's entry where it is mapped. None at an entry, or with no
+/// `.eh_frame` to say (a PE image's 32-bit code).
+fn enclosing(addr: u64) -> Option<(String, u64, u64)> {
     let home = crate::sigs::proc_home();
     let found = home.mm().lock().vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)));
-    let Some((path, off, start)) = found else {
-        return false;
-    };
+    let (path, off, start) = found?;
     let cached = lock(&FDES).get_or_insert_with(Default::default).get(&path).cloned();
     let obj = match cached {
         Some(o) => o,
@@ -370,22 +383,14 @@ fn mid_function(addr: u64) -> bool {
     };
     let (fdes, loads) = &*obj;
     // The vma's file offset gives its vaddr in the file, hence the bias.
-    let Some(base) = loads.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| v + (off - o)) else {
-        return false;
-    };
+    let base = loads.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| v + (off - o))?;
     let x = addr - start + base;
     let i = fdes.partition_point(|&(s, _)| s <= x);
-    let mid = i > 0 && fdes[i - 1].0 < x && x < fdes[i - 1].1;
-    if mid {
-        let n = MID_DECLINED.fetch_add(1, Ordering::Relaxed);
-        // Routine (a start the JIT declines; the fallback runs it), so only
-        // with each translation traced: `fjit=2`.
-        if TRACE.load(Ordering::Relaxed) && (n < 32 || (n + 1).is_power_of_two()) {
-            let name = path.rsplit('/').next().unwrap_or(&path);
-            crate::warn_line(&format!("[fjit] {addr:#x} ({name} +{x:#x}) is inside a function: left to the fallback ({} so far)\n", n + 1));
-        }
+    if !(i > 0 && fdes[i - 1].0 < x && x < fdes[i - 1].1) {
+        return None;
     }
-    mid
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    Some((name, x, fdes[i - 1].0 - base + start))
 }
 
 /// Code in `ranges` was unmapped or reprotected (`retire_unmapped_code`):
@@ -785,8 +790,10 @@ pub(crate) fn serve(pc: u64) -> bool {
 // Tier-1 runs everything first. The safepoint counts where each thread's back
 // edges and indirect branches land (lib.rs `HOT_PC`/`HOT_N`, one sample per
 // `SAFEPOINT_INTERVAL` of them), and a pc sampled `HOT_AT` times in code
-// tier-1 translated is a root: the function JIT translates from there, its
-// loop and what follows to the function's return, with the callees not yet
+// tier-1 translated makes a root: the function around it where its object's
+// `.eh_frame` says (an ELF object's), else the pc itself (a PE image's code,
+// which says nothing): the function JIT translates from there, a loop and
+// what follows to the function's return, with the callees not yet
 // translated (`Jit::translate_skipping`'s batch). A callee JIT code or a
 // unit keeps calling and nothing serves is one too (`fallback_call`).
 //
@@ -796,9 +803,10 @@ pub(crate) fn serve(pc: u64) -> bool {
 // guest's threads install it as any module of the log, compiling the same
 // bytes again from V8's cache of them. A page retired meanwhile drops the
 // translation (`publish_made`). Its root's slot gets the bridge, so the next
-// dispatch there runs the function: a thread still in the loop gets there at
-// its next sample of the root (`redirect_due`), which leaves through the run
-// loop (a trap), installs, and resumes at the root through the bridge.
+// dispatch there runs the function: a thread still in a loop that is the
+// root gets there at its next sample of it (`redirect_due`), which leaves
+// through the run loop (a trap), installs, and resumes at the root through
+// the bridge; one in a function rooted at its entry, at its next call.
 
 /// Roots asked for: each once, until its code retires or its translation is
 /// dropped.
@@ -967,22 +975,31 @@ pub(crate) fn hot_sample(pc: u64, n: u64) -> bool {
     if redirect_due(pc) {
         return true;
     }
+    let before = helper_state();
     let at = HOT_AT.load(Ordering::Relaxed).max(1) as u64;
-    // (asked already, for the multiples after the first: no JIT lock taken)
-    let asked = |a: u64| lock(&ASKED).as_ref().is_some_and(|s| s.contains(&a));
-    if n >= at && n % at == 0 && !asked(pc) && tier1_sampled(pc) && request(pc).is_some() {
-        // Translated here: published now, so this Worker goes in at once and
-        // takes no later redirect for it.
-        let len = PROMOTED_LEN.load(Ordering::Acquire);
-        SEEN.with(|s| {
-            if s.get() + 1 == len {
-                s.set(len);
-            }
-        });
-        return true;
+    if n >= at && n % at == 0 {
+        // Inside a function its object's `.eh_frame` bounds, the root is
+        // that function's entry (a root inside one is declined,
+        // `mid_function`), and it takes effect at the function's next entry.
+        // Elsewhere (a PE image's code) it is the sample's pc itself, which
+        // the thread goes into through the redirect.
+        let root = enclosing(pc).map_or(pc, |(_, _, entry)| entry);
+        // (asked already, for the multiples after the first: no JIT lock taken)
+        let asked = lock(&ASKED).as_ref().is_some_and(|s| s.contains(&root));
+        if !asked && tier1_sampled(pc) && request(root).is_some() && root == pc {
+            // Translated here: published now, so this Worker goes in at once
+            // and takes no later redirect for it.
+            let len = PROMOTED_LEN.load(Ordering::Acquire);
+            SEEN.with(|s| {
+                if s.get() + 1 == len {
+                    s.set(len);
+                }
+            });
+            return true;
+        }
     }
     // No helper after all: the roots it was to take, one a sample, here.
-    if helper_state() == HELPER_UNABLE {
+    if before == HELPER_UNABLE {
         let next = lock(&QUEUE).pop_front();
         if let Some(root) = next {
             if translate_root(root, false).is_some() && root == pc {
@@ -990,7 +1007,9 @@ pub(crate) fn hot_sample(pc: u64, n: u64) -> bool {
             }
         }
     }
-    helper_due()
+    // The process has just come to want its helper: out to JS once, which
+    // starts it (any later trap would too).
+    before != HELPER_WANTED && helper_due()
 }
 
 /// JS, at a trap of the process's Worker: 1 once when the process wants its
