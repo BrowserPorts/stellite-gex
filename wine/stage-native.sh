@@ -39,9 +39,12 @@ trap 'rm -rf "$tmp"' EXIT
 # d3d11.dll and dxgi.dll,
 # third_party/mesa/subprojects/dxvk/tests/dirk/w64/build.sh): for each,
 # NAME.so.r.o, NAME.so.exports, NAME.spec and NAME.imports (a comma list) in
-# DIR. Their skeletons go in OUTDIR/extra, not beside the others: a prefix
-# loads them only when told to (a DLL override), its own DLLs of those names
-# staying.
+# DIR. Their code is linked into the core, where it serves the dist's own
+# builtin d3d11.dll and dxgi.dll: a prefix runs dirk with no DLL override (with
+# the page's d3d device, start's d3d: true), and a d3d11,dxgi=n override makes
+# the loader look for a native DLL and fail ("import_dll Library d3d11.dll ...
+# not found"). Skeletons of them are written to OUTDIR/extra as well; no prefix
+# loads those.
 extra=() extras=()
 if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
     for ro in "$WINE64_EXTRA_DLLS"/*.so.r.o; do
