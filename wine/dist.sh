@@ -571,7 +571,15 @@ else
 		XK=" exports $(sort -u "$PELINK_EXPORTS" | sha256sum | cut -c1-10)"
 	fi
 fi
-NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)
+# WINE64_EXTRA_DLLS=DIR: DLLs built outside the tree that stage-native.sh links
+# into the core (dirk's d3d11.dll and dxgi.dll), by their bytes: a core staged
+# without them, or with an older build of them, is another core.
+EK=
+if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
+	ls "$WINE64_EXTRA_DLLS"/*.so.r.o >/dev/null 2>&1 || { log "no NAME.so.r.o in WINE64_EXTRA_DLLS $WINE64_EXTRA_DLLS"; exit 1; }
+	EK=" extra $(cd "$WINE64_EXTRA_DLLS" && cat *.so.r.o *.so.exports *.spec *.imports | sha256sum | cut -c1-10)"
+fi
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK$EK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)
 DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
