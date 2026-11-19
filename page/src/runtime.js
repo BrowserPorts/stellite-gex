@@ -118,6 +118,13 @@ function unitModuleWorker(zstd) {
   };
 }
 
+/** A unit's Module from its plain URL, compiled off the guest's threads. */
+async function plainUnitModule(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return WebAssembly.compile(await r.arrayBuffer());
+}
+
 /** `fetchUnit`, but a unit the fill brings (`late`: key to its Module's
  *  promise) from there: one download of it, not two. */
 function lateFirst(late, fetchUnit) {
@@ -593,9 +600,10 @@ export async function makeProcessHost({
   const host = new ProcessHost({
   makeWorker: makeGuestWorker,
   // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
-  // Worker of its own, off this thread.
-  unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
-    ? lateFirst(lateUnits, unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD))) : null,
+  // Worker of its own, off this thread. A late unit (app.js: the fill's, or
+  // a page's own by URL) is the page's Module, compiled while the guest runs.
+  unitModule: globalThis.GEX_CGEN && ((globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD) || lateUnits?.size)
+    ? lateFirst(lateUnits, globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : plainUnitModule) : null,
   shim: shimBytes,
   // The closure's image module in place of the seed: it holds the program's
   // own text, already lifted.
@@ -679,7 +687,7 @@ export async function makeProcessHost({
     // with no units; `?providers=0` runs glibc's
     // own code translated instead.
     // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-    cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined })
+    cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined, late: globalThis.GEX_CGEN_LATE })
       : flag('providers') === '0' ? undefined
       : { mode: 8, url: assetUrl('/gex/cgen'), files: assetFiles('/gex/cgen/') },
     // `?aot=1`: an ejected project's run, with no run-time translation (a

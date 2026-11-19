@@ -607,6 +607,26 @@ async function begin(opts, base, at, state, meter, lets) {
   // The two small lists are read before the bundle starts, so the totals
   // are whole from the first count.
   const preList = b.preload ? await fetch(at(b.preload)).then((r) => (r.ok ? r.json() : null)).catch(() => null) : null;
+  // A unit's module the list names by its own URL, not in an archive (a game's
+  // units, which its page adds: `cgen:KEY` and its `file:KEY/c.entries`) is
+  // late: the guest starts without waiting for it, the page compiles it
+  // meanwhile, and a process that maps its image first gets the Module when
+  // it is in (the host's `prefetchUnit`) or loads it itself from that URL
+  // (worker.mjs `loadFile`). Its entries stay in the list: they are what
+  // tells a process the unit exists. Only the runtime's own archives and
+  // files hold the start.
+  const lateList = (preList ?? []).filter(([name, path]) => name.startsWith('cgen:') && !String(path).endsWith('.tar'));
+  const lateUnits = new Map();
+  if (lateList.length) {
+    globalThis.GEX_CGEN_LATE = Object.fromEntries(lateList.map(([name, path]) => [name.slice(5), at(path)]));
+    for (const [name] of lateList) {
+      let resolve, reject;
+      const pr = new Promise((y, n) => { resolve = y; reject = n; });
+      pr.catch(() => {});
+      lateUnits.set(name.slice(5), Object.assign(pr, { resolve, reject }));
+    }
+  }
+  const bootList = preList ? preList.filter((e) => !lateList.includes(e)) : null;
   {
     const d = meter.p.download;
     for (const href of [...b.tar.map(at), ...(pieceList?.pieces ?? []).map(([url]) => at(url)), ...(preList ?? []).map(([, path]) => at(path))]) {
@@ -620,11 +640,33 @@ async function begin(opts, base, at, state, meter, lets) {
       if (e) { d.files++; d.total += e.zsize ?? 0; }
     }
     // A units archive (`tar:N`) holds N modules.
-    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:'))
+    meter.p.compile.total = (bootList ?? []).filter(([name]) => !name.startsWith('file:'))
       .reduce((n, [name]) => n + (name.startsWith('tar:') ? Number(name.slice(4)) || 0 : 1), 0);
     meter.tick();
   }
-  const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
+  const preloading = bootList ? preloadUnits(bootList, fetcher, at) : Promise.resolve(null);
+  // The late modules, downloaded and compiled beside the boot's (not
+  // awaited): each resolves its promise and joins the modules every Worker
+  // started after it is given.
+  const lateCompiled = [];
+  // Set once the boot's modules are in: a late Module compiled after that
+  // joins them at once.
+  let joinLate = null;
+  const lateDone = lateList.map(async ([name, path]) => {
+    const key = name.slice(5);
+    const href = at(path);
+    try {
+      const mod = (await packedEntry(href, fetcher))
+        ? await WebAssembly.compile(await fetchShared(href, fetcher))
+        : await WebAssembly.compile(await (await fetch(href)).arrayBuffer());
+      if (joinLate) joinLate([name, mod]);
+      else lateCompiled.push([name, mod]);
+      lateUnits.get(key)?.resolve(mod);
+    } catch (e) {
+      lateUnits.get(key)?.reject(e);
+      console.warn(`[app] late unit ${href}: ${e?.message ?? e}`);
+    }
+  });
   // The runtime's wasm, compressed in the pack when the site packed it
   // (plain, the shim alone was 6.6 MB of Paint's download), and fetched now,
   // first, when it did not: a module left for the program to fetch (the 2 KB seed,
@@ -771,12 +813,21 @@ async function begin(opts, base, at, state, meter, lets) {
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (!streamed && meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
   const preModules = await preloading;
+  if (lateList.length && preModules) {
+    joinLate = (entry) => {
+      // Before `closed`, which a Worker reads as the end of the list.
+      const c = preModules.findIndex(([k]) => k === 'closed');
+      preModules.splice(c < 0 ? preModules.length : c, 0, entry);
+    };
+    for (const entry of lateCompiled.splice(0)) joinLate(entry);
+    const t0 = performance.now();
+    Promise.all(lateDone).then(() => mark(`late units: ${lateList.length} in, the last ${Math.round(performance.now() - t0)} ms after the start`, true));
+  }
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   // The fill: its buffer and counter made now, every Worker given them; its
   // download started now, after the boot's, so it does not share their link.
   let fill = null;
-  const lateUnits = new Map();
   const fl = fillList ? await fillList : null;
   if (fl && typeof SharedArrayBuffer === 'function') {
     const buf = new SharedArrayBuffer(fl.size);

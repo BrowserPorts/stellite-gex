@@ -722,6 +722,12 @@ async function handle(msg) {
     // page's server only, not the page's own preloaded files.
     prefetchUnit(key) {
       const c = msg.cgen;
+      // A late unit (app.js: one the page names by its own URL, compiling it
+      // while the guest runs): the host hands its Module over when it is in.
+      if (c?.late?.[key] && !preFiles.has(`${key}/c.wasm`)) {
+        port.post({ kind: 'prefetchUnit', key, url: c.late[key] });
+        return;
+      }
       if (!c?.url || preClosed || preFiles.has(`${key}/c.wasm`)) return;
       let url;
       try { url = new URL(`${c.url}/${key}/c.wasm${c.zst ? '.zst' : ''}`, globalThis.location?.href).href; } catch { return; }
@@ -797,6 +803,21 @@ async function handle(msg) {
       // before the page had compiled it waits for its bytes there.
       const late = fillFile(`unit:${rel}`);
       if (late) return late;
+      // A late unit's module wanted before the page's compiled one reached
+      // this Worker: its bytes from its own URL, here.
+      const lateUrl = rel.endsWith('/c.wasm') ? c.late?.[rel.slice(0, -'/c.wasm'.length)] : null;
+      if (lateUrl) {
+        const x = new XMLHttpRequest();
+        x.open('GET', lateUrl, false);
+        x.responseType = 'arraybuffer';
+        const done = noteFetch(`unit:${rel}`, 0, this.owner);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
+        return x.status === 200 ? new Uint8Array(x.response) : null;
+      }
       if (preClosed) return null;
       if (unitFiles.has(rel)) {
         const b = unitFiles.get(rel);
