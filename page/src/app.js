@@ -120,7 +120,14 @@ const PIECES = {
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
- *   onLog(text)     the program's terminal output
+ *   onLog(text)     the program's terminal output (without `terminal`), and
+ *              gex's own messages
+ *   terminal   the program's terminal: an xterm.js Terminal, or anything with
+ *              its write(data), onData(fn) and onResize(fn) (each returning
+ *              {dispose}), rows and cols. The program then runs on a pty: what
+ *              it writes goes to terminal.write, not onLog, and what onData
+ *              gives reaches its input, so an interactive shell prompts and
+ *              reads keys. Without it the program has pipes and no input.
  *   onExit(status)  called when it exits
  *   onCrash({ pid, name, reason, code, signal })
  *              a program of the run crashed (the System's `crash` event,
@@ -906,7 +913,18 @@ async function begin(opts, base, at, state, meter, lets) {
   ], lazyVersions).catch(() => {});
   pruneFiles(fetcher).catch(() => {});
 
-  const term = {
+  // The page's terminal (`opts.terminal`), or a stand-in that writes to onLog
+  // and gives no input.
+  const pageTerm = opts.terminal ?? null;
+  const term = pageTerm ? {
+    rows: pageTerm.rows ?? 24,
+    cols: pageTerm.cols ?? 80,
+    write(d) { pageTerm.write(d); },
+    writeln(s) { pageTerm.write(`${s}\r\n`); },
+    onData(fn) { return pageTerm.onData(fn); },
+    onResize(fn) { return pageTerm.onResize?.(fn) ?? { dispose() {} }; },
+    focus() { pageTerm.focus?.(); },
+  } : {
     rows: 40,
     cols: 120,
     write(d) { say(typeof d === 'string' ? d : new TextDecoder().decode(d)); },
@@ -961,7 +979,7 @@ async function begin(opts, base, at, state, meter, lets) {
     args,
     cwd,
     uid: opts.uid ?? b.uid,
-    tty: false,
+    tty: !!pageTerm,
     gl: gl ? 'compositor' : null,
     glLazy,
     glSource: mesa,
