@@ -4,9 +4,10 @@
 # toolchain/pins. wine/dist.sh builds the Wine tree it is given and says so
 # when that tree is not at WINE64_COMMIT.
 
-# The Wine fork: branch w64/gex-surface.
-WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE64_COMMIT := 037e07d0dd7457ca765958829406d7e5ceea84e0
+# The Wine fork: wine-stellite, branch stellite (the 64-bit Wine work with Stellite's own: WoW64's
+# LPC layout, winlogon, the shared-block file copies).
+WINE64_REPO   := https://origin.cursor.com/mov/wine-stellite.git
+WINE64_COMMIT := 145797aa7f6c6b47055c0d5ec5b853ebfd9d22ef
 
 # The 32-bit Wine tree (branch wasm32-w3-next): the wineserver's build, and
 # the legacy 32-bit dist (make wine32).
