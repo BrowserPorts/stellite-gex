@@ -19,6 +19,9 @@
 //                        (only when named)
 //   GEX_LOG=spare        spare thread Workers: a program's offer, each spare
 //                        started, caught up and given its thread (only when named)
+//   GEX_LOG=fjit         the function JIT's hot tier: its helper Worker asked for
+//                        and ended, each module it translated and compiled, and
+//                        each one a guest Worker compiled itself (only when named)
 //   GEX_LOG=win          a line when a toplevel appears, first shows pixels and
 //                        is retitled, in the page's desktop (only when named)
 //   GEX_LOG=dlpack       a line per wasm32 library whose exports the page packs

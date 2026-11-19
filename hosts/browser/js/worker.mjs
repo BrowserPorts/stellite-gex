@@ -441,6 +441,12 @@ async function handle(msg) {
     for (const [key, mod] of msg.entries ?? []) pooled.set(key, mod);
     return;
   }
+  // The host will not start the hot tier's helper this Worker asked for
+  // (`startFjitHelper`): its process translates inline.
+  if (msg?.kind === 'fjitHelperNo') {
+    workerGex?.fjitHelperRefused();
+    return;
+  }
   // While this Worker waits in the pool: the kernel, shim and guest
   // instances on a fresh memory, which `attach` would otherwise make after
   // the process arrived (3.3 ms of an exec'd child's 10.6 ms start).
@@ -679,6 +685,13 @@ async function handle(msg) {
     offerSpare(spare) {
       recyclable = false;
       port.post({ kind: 'threadSpare', spare });
+    }
+    // The hot tier's helper for this process (`Gex#fjitHelperDue`): a Worker
+    // on its memory, started by the host as a spare is, that runs no thread
+    // (`Gex#fjitServe`). The host answers `fjitHelperNo` when it will not.
+    startFjitHelper(spare) {
+      recyclable = false;
+      port.post({ kind: 'fjitHelper', spare });
     }
     // A module this Worker just compiled, up to the host to relay to the sibling
     // Workers of the same process so they reuse it rather than recompiling the

@@ -3931,7 +3931,9 @@ export class Gex {
   /** A child's run options, said to its kernel (`adoptProcess`). */
   #fjitOn(e, o) {
     if (!o.fjit || !e.gex_set_fjit) return;
-    e.gex_set_fjit(o.fjit === 2 ? 2 : 1);
+    // 1 (2 traced): at the first miss; 3 (4): hot, a helper Worker
+    // translating; 5 (6): hot, inline (page-globals.js, fjit.rs `gex_set_fjit`).
+    e.gex_set_fjit(Number.isInteger(o.fjit) && o.fjit >= 1 && o.fjit <= 6 ? o.fjit : 1);
     if (o.fjitMax != null || o.fjitOnly) e.gex_fjit_limit?.(o.fjitMax ?? 0xffffffff, BigInt(o.fjitOnly ?? 0));
     // Units for the JIT's sake alone: an image without one is said only
     // under GEX_LOG=unit (bit 5 quiets it otherwise).
@@ -4415,6 +4417,12 @@ export class Gex {
     this.#promise = !thread.spare;
     // A Worker whose last thread ended (`parkThread`) is attached already.
     if (!thread.parked) await this.attach(shimWasm, guestWasm, { devices: false });
+    // The hot tier's helper (`#fjitHelperDue`): no thread, no module to
+    // install, the JIT's queue until the process's program is over.
+    if (thread.fjitHelper) {
+      await this.#fjitServe();
+      return { entry: 0n, ctx: 0, gone: true };
+    }
     if (thread.spare) {
       // Everything the process has installed so far, before it has a thread;
       // what it installs meanwhile is caught up with below, as any thread's.
@@ -6159,7 +6167,114 @@ export class Gex {
     }
     this.#sharedModules.set(name, mod);
     this.#offerModule(name, mod, bytes.byteLength);
+    if (logNamed('fjit')) console.warn(`[fjit] pid ${e.gex_my_pid?.() ?? '?'}: module ${n} (${bytes.byteLength} bytes) compiled here in ${dt.toFixed(1)} ms`);
     return mod;
+  }
+
+  /** The hot tier's helper (fjit.rs, `?fjit=hot`): a Worker of this process
+   *  that runs no thread, translating and compiling what the safepoint finds
+   *  hot (`#fjitServe`), asked of the host at the first such root. None where
+   *  a thread cannot have a Worker of its own (the single-thread build, a
+   *  memory not shared): the shim translates inline then. */
+  #fjitHelperDue() {
+    const e = this.#shim.exports;
+    if (!e.gex_fjit_helper_wanted?.()) return;
+    const why = (SP_CODE && single.on) ? 'single-thread build'
+      : typeof this.#env.startFjitHelper !== 'function' ? 'no startFjitHelper'
+      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '';
+    if (logNamed('fjit')) console.warn(`[fjit] pid ${e.gex_my_pid?.() ?? '?'}: helper ${why ? `not started (${why}), translating inline` : 'asked for'}`);
+    if (why) {
+      e.gex_fjit_helper_up(-1);
+      return;
+    }
+    // Another Worker publishes into the function table from now on: this
+    // one's table keeps the room a threaded process's does.
+    this.#threaded();
+    this.#programStore(true);
+    this.#env.startFjitHelper({
+      memory: this.#memory,
+      moduleStore: this.#moduleStore ?? undefined,
+      compat: e.gex_compat?.() ?? 0,
+      procOpts: this.#opts,
+      execGen: e.gex_exec_gen?.() ?? 0,
+    });
+  }
+
+  /** The host would not start the helper (`#fjitHelperDue`): what the
+   *  process queued for it is translated inline. */
+  fjitHelperRefused() {
+    this.#shim?.exports?.gex_fjit_helper_up?.(-1);
+  }
+
+  /** The helper's loop, on its Worker (`adoptThread`): take the oldest root
+   *  the safepoints queued, translate it in the shim (`gex_fjit_bg_translate`),
+   *  compile it here (V8 compiles off this thread too), then publish it
+   *  (`gex_fjit_bg_publish`, which drops it if its code retired meanwhile).
+   *  The guest's Workers install it from the log, compiling the same bytes
+   *  again from V8's cache of them while this Worker holds the module, or
+   *  taking it as relayed. Until the process exits or runs another program. */
+  async #fjitServe() {
+    const e = this.#shim.exports;
+    const gen = e.gex_exec_gen?.() ?? 0;
+    const at = e.gex_fjit_bg_word() >>> 0;
+    const said = logNamed('fjit');
+    const pid = e.gex_my_pid?.() ?? '?';
+    const stats = { made: 0, published: 0, dropped: 0, declined: 0, translateMs: 0, compileMs: 0 };
+    const live = () => !e.gex_exited?.() && (e.gex_exec_gen?.() ?? 0) === gen;
+    e.gex_fjit_helper_up(1);
+    if (said) console.warn(`[fjit] pid ${pid}: helper up`);
+    try {
+      while (live()) {
+        const word = new Int32Array(this.#memory.buffer, at, 1);
+        const seq = Atomics.load(word, 0);
+        // The guest's Workers grow the memory as they map code: this
+        // Worker's bound on it is taken again before reading any.
+        try { this.#memory.grow(0); } catch { this.#memory.grow(0n); }
+        const t0 = performance.now();
+        const n = e.gex_fjit_bg_translate();
+        if (n === -1) {
+          // Nothing queued: until the next root (or a while, to look at the
+          // process again).
+          const w = Atomics.waitAsync ? Atomics.waitAsync(word, 0, seq, 500) : null;
+          if (w?.async) await w.value;
+          else if (!w) await new Promise((r) => setTimeout(r, 20));
+          continue;
+        }
+        const t1 = performance.now();
+        stats.translateMs += t1 - t0;
+        if (n < 0) {
+          stats.declined++;
+          continue;
+        }
+        stats.made++;
+        const ptr = e.gex_fjit_ptr(n) >>> 0;
+        const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+        const name = `fjit:${moduleContentKey(bytes)}`;
+        let ok = 1;
+        if (!this.#sharedModules.has(name)) {
+          try {
+            const mod = await WebAssembly.compile(bytes);
+            // Held here while the process runs: a guest Worker compiling
+            // the same bytes gets V8's code for them.
+            this.#sharedModules.set(name, mod);
+            this.#offerModule(name, mod, bytes.byteLength);
+          } catch (err) {
+            console.error(`[fjit] pid ${pid}: module ${n} did not compile (${err?.message ?? err}); left to tier-1`);
+            ok = 0;
+          }
+        }
+        const t2 = performance.now();
+        stats.compileMs += t2 - t1;
+        if (!live()) break;
+        const idx = e.gex_fjit_bg_publish(n, ok);
+        if (idx >= 0) stats.published++;
+        else stats.dropped++;
+        if (said) console.warn(`[fjit] pid ${pid}: module ${n} (${bytes.byteLength} bytes) translated in ${(t1 - t0).toFixed(1)} ms, compiled in ${(t2 - t1).toFixed(1)} ms, ${idx >= 0 ? 'published' : 'dropped'}`);
+      }
+    } finally {
+      if (live()) e.gex_fjit_helper_up(0);
+      if (said) console.warn(`[fjit] pid ${pid}: helper ends: ${stats.made} made, ${stats.published} published, ${stats.dropped} dropped, ${stats.declined} declined; ${stats.translateMs.toFixed(0)} ms translating, ${stats.compileMs.toFixed(0)} ms compiling`);
+    }
   }
 
   /** Replay the function table's log this Worker has not seen: installs,
@@ -8145,6 +8260,7 @@ export class Gex {
     // (out of guest code, so the exec did not wait for it): what is staged
     // and published now is the new program's, for that thread's Worker.
     if (e.gex_thread_gone?.()) return;
+    this.#fjitHelperDue();
     this.#wasmprogServe();
     // ELF libraries' export providers (cgen/elfprov.rs): provider-only units,
     // bound before the guest goes on (and, in a forked child, before it

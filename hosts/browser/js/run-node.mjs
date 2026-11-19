@@ -619,8 +619,10 @@ const host = new ProcessHost({
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     // GEX_LOG=1: gex's debug output (log.mjs); Workers see the environment too.
     log: process.env.GEX_LOG || undefined,
-    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
-    fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half), at each
+    // first miss; GEX_FJIT=hot (hotsync): driven by the safepoint's samples,
+    // translated on a helper Worker (inline), as the page's `?fjit=`.
+    fjit: process.env.GEX_FJIT ? ({ hot: 3, hotsync: 5 }[process.env.GEX_FJIT] ?? (Number(process.env.GEX_FJIT) || 1)) : undefined,
     // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
     // runs, saved under that name.
     xcache: process.env.GEX_XCACHE || undefined,

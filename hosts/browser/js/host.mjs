@@ -2139,6 +2139,32 @@ export class ProcessHost {
         this.#startSpare(proc);
         break;
       }
+      case 'fjitHelper': {
+        // The hot tier's helper for a process (`Gex#fjitHelperDue`): a
+        // Worker on its memory, started as a spare is but never given a
+        // thread (not among `#spares`), that translates and compiles what
+        // the process's safepoints find hot (`Gex#fjitServe`) until the
+        // process exits or runs another program. Where a spare could not be
+        // started, nor can it: the process then translates inline.
+        const proc = String(pid).split(':')[0];
+        if (this.#foreign(proc) || !this.#extra?.shared || (SP_CODE && single.on)) {
+          w.postMessage({ kind: 'fjitHelperNo' });
+          break;
+        }
+        const s = m.spare;
+        this.#threadWorker(proc, `${proc}:fjit${++this.#spareSeq}`, {
+          kind: 'thread',
+          spare: true,
+          fjitHelper: true,
+          memory: s.memory,
+          moduleStore: s.moduleStore,
+          compat: s.compat,
+          procOpts: s.procOpts,
+          execGen: s.execGen,
+          park: false,
+        });
+        break;
+      }
       case 'stdin': {
         // Only pid 1 has a terminal; a child reads the inherited descriptor,
         // which is the kernel's business, not this file's.

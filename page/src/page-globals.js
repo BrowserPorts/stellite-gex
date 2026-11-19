@@ -18,9 +18,13 @@ export function setGlobals(get, b = {}) {
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a 32-bit Wine program's
-  // start-up).
+  // start-up). `fjit=1` translates each function at its first miss, on the
+  // thread that missed; `fjit=hot` leaves the first run to tier-1 and
+  // translates what the safepoint's samples find hot on a helper Worker of
+  // the process; `fjit=hotsync` is that with the translation inline (fjit.rs
+  // `gex_set_fjit`'s numbers: 3 and 5).
   const fjit = get('fjit');
-  if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
+  if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = { hot: 3, hotsync: 5 }[fjit] ?? (Number(fjit) || 1);
   if (get('elfunits') && get('cgen') !== '0') globalThis.GEX_ELF_UNITS = get('elfunits');
   if (get('pins')) globalThis.GEX_PINS = get('pins');
   if (get('dense') === '0') globalThis.GEX_DENSE = 0;

@@ -15857,7 +15857,8 @@ pub extern "C" fn gex_after_trap(installed: u32, wasmdll_have: u32, flags: u32) 
         || vfork::gex_vfork_ok() != -2
         || FORK.with(|f| f.get()[0]) != 0
         || THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
-        || cgen::fault_staged();
+        || cgen::fault_staged()
+        || fjit::helper_due();
     if busy {
         return 0;
     }
@@ -17080,6 +17081,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             if !own && !alt {
                 return;
             }
+            // A hot-tier translation made meanwhile on a helper read the old
+            // bytes: it is not published (fjit.rs `publish_made`).
+            fjit::code_changed(page, page + 1);
             let home = if jit_diag() { sigs::home() } else { None };
             let mut gm = guest();
             for (k, gone) in [(page, own), (key, alt)] {
@@ -17182,10 +17186,16 @@ fn safepoint(ctx: i32, pc: i64) {
     // translated code, so back-edges are the only place to say where it is and
     // tell a long stretch of execution from a hang.
     let every = unsafe { HEARTBEAT };
+    // The hot tier (`?fjit=hot`) counts too: its roots are these samples
+    // (fjit.rs `hot_sample`). Not a thread in the process's other mode, whose
+    // code the function JIT does not take.
+    let hot = fjit::hot() && !thread_alt();
+    // How many times this pc has been sampled, for the hot tier.
+    let mut sampled = 0u64;
     // Counting is its own switch, not a side effect of the heartbeat: "say
     // where the guest is every N safepoints" (a stuck run) and "which back
     // edges are hot" (a slow one) are different questions.
-    if every != 0 || unsafe { HOT_ON } {
+    if every != 0 || unsafe { HOT_ON } || hot {
         static mut BEAT: u64 = 0;
         let beat = unsafe {
             BEAT = BEAT.wrapping_add(1);
@@ -17198,9 +17208,11 @@ fn safepoint(ctx: i32, pc: i64) {
             let slot = (pc as u64 as usize >> gex_abi::DISPATCH_SHIFT) % HOT_SLOTS;
             if HOT_PC[slot] == pc as u64 {
                 HOT_N[slot] += 1;
+                sampled = HOT_N[slot];
             } else if HOT_N[slot] == 0 {
                 HOT_PC[slot] = pc as u64;
                 HOT_N[slot] = 1;
+                sampled = 1;
             } else {
                 // Someone else's slot: age it rather than fight, so a hot
                 // address wins within a few thousand samples.
@@ -17326,6 +17338,16 @@ fn safepoint(ctx: i32, pc: i64) {
                 trap();
             }
         }
+    }
+    // The hot tier: this sample's pc made a root, or a function was published
+    // at it since, or the process's helper is to be started. The thread leaves
+    // as a catch-up miss does and goes on at `pc` through the run loop, which
+    // installs what the log holds (the bridge in `pc`'s slot among it).
+    if hot && fjit::hot_sample(pc as u64, sampled) {
+        let _ = guest().write_u64(ctx as u32 as u64 + ctx::PC as u64, pc as u64);
+        set_resume(pc as u64);
+        set_resume_ctx(my_ctx());
+        trap();
     }
     // Preemption is the engine's job now: there is no other thread here to hand
     // the stack to, since each is a Worker already running.
