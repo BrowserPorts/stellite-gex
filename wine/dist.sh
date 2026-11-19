@@ -661,8 +661,14 @@ if [ "$M64" != 0 ]; then
 	if [ "${WINE64_M64_NATIVE:-0}" != 0 ]; then
 		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 	fi
-	"$here/prefix-key.sh" --add "$C/pfx64-$PX/pfx" "$DIST" || exit 1
-	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
+	# No prefix of its own: PX is prefix_steps', which this branch does not
+	# run, and a twin takes the main install's prefix (it reads only the
+	# dist and the PE core from here)
+	if [ -n "${PX:-}" ]; then
+		"$here/prefix-key.sh" --add "$C/pfx64-$PX/pfx" "$DIST" || exit 1
+		echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"
+	fi
+	echo "WINE64_DIST=$DIST"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
 	echo "WINE64_BUILD=$C/b64-$K-$S"
 	[ "${WINE64_M64_NATIVE:-0}" = 0 ] || echo "WINE64_NATIVE=$NATIVE"
 	exit 0
