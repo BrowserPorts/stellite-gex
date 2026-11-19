@@ -5218,17 +5218,18 @@ impl<'a> Emitter<'a> {
                 // already the target (stored above) and the registers are
                 // flushed, so the slow path may deliver a signal and unwind.
                 // The pc handed to the poll is what the host writes back as
-                // the context PC, and what a dispatch miss right after this
-                // resumes from. On A64 the branch's own address serves: the
-                // instruction is re-executed and re-reads its register. On
-                // x86-64 `end - 1` is inside the branch instruction, so the
-                // poll gets the target itself -- the value the PC already
-                // holds, and the only address that is safe to resume at.
-                if gex_abi::X86 {
-                    self.emit_safepoint_no_flush_dynamic();
-                } else {
-                    self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN);
-                }
+                // the context PC, and what the miss stub hands the host when
+                // the dispatch right after this misses: so it is the target,
+                // the value the PC already holds. The branch has been taken,
+                // and a signal here is one between it and the instruction at
+                // its target, as on hardware. (A64 once passed the branch's
+                // own address, to be run again. A miss after an expired
+                // countdown was then reported at the branch: a target that
+                // always misses, the signal-return trampoline at a handler's
+                // `ret`, translated the `ret` anew each time, and after 64
+                // such the host took it for a livelock and ended the
+                // process.)
+                self.emit_safepoint_no_flush_dynamic();
                 self.emit_dispatch_tail_call();
             }
             Term::Syscall { next } => {
@@ -5269,20 +5270,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The safepoint countdown, for a caller that has already flushed and
-    /// carries on rather than jumping.
-    ///
-    /// Unlike [`Self::emit_safepoint`] this never flushes -- an indirect branch
-    /// has flushed already and its target is in a local -- so it emits only the
-    /// counter and the call.
-    fn emit_safepoint_no_flush(&mut self, pc: u64) {
-        let before = self.f.code.len();
-        self.emit_safepoint_no_flush_inner(pc);
-        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
-    }
-
-    /// The poll with the pc taken from `scratch_i64` (the branch target an
-    /// indirect terminator has just stored) rather than a constant.
+    /// The safepoint countdown for an indirect branch, which has flushed
+    /// already and carries on to dispatch: unlike [`Self::emit_safepoint`] it
+    /// never flushes, and the poll's pc is the branch target `scratch_i64`
+    /// holds (and the context's PC already says), not a constant.
     fn emit_safepoint_no_flush_dynamic(&mut self) {
         let before = self.f.code.len();
         self.ctx_base();
@@ -5301,24 +5292,6 @@ impl<'a> Emitter<'a> {
         self.f.call(self.cx.safepoint);
         self.f.end();
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
-    }
-
-    fn emit_safepoint_no_flush_inner(&mut self, pc: u64) {
-        self.ctx_base();
-        self.ctx_base();
-        self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
-        self.f.i32_const(1);
-        self.f.byte(0x6b); // i32.sub
-        self.f.local_tee(self.scratch_i32);
-        self.f.store(0x36, 2, ctx::SAFEPOINT_COUNTER as u32);
-        self.f.local_get(self.scratch_i32);
-        self.f.i32_const(0);
-        self.f.byte(0x4c); // i32.le_s
-        self.f.if_void();
-        self.f.local_get(self.ctx_local);
-        self.f.i64_const(pc as i64);
-        self.f.call(self.cx.safepoint);
-        self.f.end();
     }
 
     /// Poll for a pending signal before a backward jump.

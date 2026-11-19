@@ -75,13 +75,26 @@ pub fn build_lock() -> Result<BuildLock> {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = write!(f, "{}", std::process::id());
+                // A lock without its pid would be left to wait on: none is kept
+                if let Err(e) = write!(f, "{}", std::process::id()).and_then(|()| f.flush()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(anyhow!("{}: {e}", path.display()));
+                }
                 return Ok(BuildLock(path));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = std::fs::read_to_string(&path).unwrap_or_default();
                 let alive = holder.trim().parse::<u32>().is_ok_and(gex_kernel::hostos::calls().alive);
-                if !alive && !holder.is_empty() {
+                // A builder writes its pid as soon as it has made the file, so
+                // one still empty after a while is a builder that died between
+                // the two, and holds nothing
+                let abandoned = holder.is_empty()
+                    && std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(10));
+                if (!alive && !holder.is_empty()) || abandoned {
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
