@@ -46,8 +46,11 @@ static DRIVE: AtomicU8 = AtomicU8::new(AT_MISS);
 /// Samples (`hot_sample`'s count, one per safepoint at that pc, which comes
 /// every `SAFEPOINT_INTERVAL` back edges and indirect branches of a thread)
 /// that make a pc hot; asked again at each multiple of it, for a translation
-/// a code change dropped. `?fjitlibs=hotn=N` sets it.
-static HOT_AT: AtomicU32 = AtomicU32::new(8);
+/// a code change dropped. `?fjitlibs=hotn=N` sets it. At 8, Notepad's start
+/// with no units (eight Wine processes, each with a helper) took 5.77 s
+/// against tier-1's 5.26; at 32, 5.52: fewer of start-up's loops count as
+/// hot, and 32K back edges are still a few milliseconds of a loop that is.
+static HOT_AT: AtomicU32 = AtomicU32::new(32);
 /// At most this many translations, the rest declined (bisecting a bad one).
 static LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 /// Translate only the function at this address (0: any).
