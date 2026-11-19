@@ -16,8 +16,9 @@
 //! ways. At the first miss (`?fjit=1`): every miss and every lookup miss is
 //! translated on the Worker that missed, before its thread goes on. Hot
 //! (`?fjit=hot`): tier-1 takes every miss, and the JIT takes what the
-//! safepoint's back-edge samples find hot (`hot_sample`), plus what JIT code
-//! looks up and finds no function for; a helper Worker of the process
+//! safepoint's back-edge samples find hot (`hot_sample`), plus the callees
+//! JIT code and units keep calling through the fallback (`fallback_call`);
+//! a helper Worker of the process
 //! translates and compiles it off the guest's threads (`gex_fjit_bg_*`,
 //! gex.mjs `#fjitServe`) while tier-1 runs it, and a thread whose loop it was
 //! goes into the new function at its next sample there (`redirect_due`).
@@ -498,10 +499,9 @@ fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
 
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
 /// its index in the function table, or `None` (the fallback runs it). Hot,
-/// a call from JIT code or a unit makes it hot: asked for as a sample is
-/// (`request`), which translates it here only with no helper (`hotsync`).
+/// not yet: the fallback's calls count (`fallback_call`).
 pub(crate) fn translate(addr: u64) -> Option<u32> {
-    let r = if hot() { request(addr) } else { translate_root(addr, crate::thread_alt()) };
+    let r = if hot() { None } else { translate_root(addr, crate::thread_alt()) };
     if addr != 0 && addr == SCAN_CONST.load(Ordering::Relaxed) {
         crate::warn_line(&format!("[fjitscan] translation asked at {addr:#x}: {r:?}\n"));
     }
@@ -787,8 +787,8 @@ pub(crate) fn serve(pc: u64) -> bool {
 // `SAFEPOINT_INTERVAL` of them), and a pc sampled `HOT_AT` times in code
 // tier-1 translated is a root: the function JIT translates from there, its
 // loop and what follows to the function's return, with the callees not yet
-// translated (`Jit::translate_skipping`'s batch). An address JIT code or a
-// unit calls and nothing serves is one too: what hot code calls is hot.
+// translated (`Jit::translate_skipping`'s batch). A callee JIT code or a
+// unit keeps calling and nothing serves is one too (`fallback_call`).
 //
 // The translation runs on a helper Worker of the process (gex.mjs
 // `#fjitServe`), started at the first root, which compiles the module as well
@@ -898,7 +898,7 @@ fn tier1_sampled(pc: u64) -> bool {
     crate::with_jit_only(|j| j.translated.contains(&gex_abi::addr_key(pc, false))) && crate::cgen::unit_pages_of(&[pc / gex_abi::DISPATCH_PAGE]).is_empty()
 }
 
-/// Ask for a root (a hot sample's pc, or an address JIT code looked up):
+/// Ask for a root (a hot sample's pc, or a callee the fallback keeps running):
 /// translated here (`hotsync`, or a process that can have no helper), its
 /// index then, or queued for the helper.
 fn request(root: u64) -> Option<u32> {
@@ -923,6 +923,40 @@ fn request(root: u64) -> Option<u32> {
         set_helper(HELPER_WANTED);
     }
     None
+}
+
+/// Calls JIT code and units made through the fallback (`cgen::gex_ftab_fallback`,
+/// tier-1 run as a call-out), counted by target as the safepoint counts its
+/// samples, direct-mapped and aging: a callee called `HOT_CALLS` times that
+/// way is a root. A unit's call out of its image to a function nothing else
+/// serves, made a few times at start-up, is not one: asked at its first call
+/// (as at the first miss), they started a helper in each Wine process with
+/// units, and Notepad's start took 3.70 s against 3.47 s on tier-1.
+const CALL_SLOTS: usize = 1024;
+static CALL_PC: [AtomicU64; CALL_SLOTS] = [const { AtomicU64::new(0) }; CALL_SLOTS];
+static CALL_N: [AtomicU32; CALL_SLOTS] = [const { AtomicU32::new(0) }; CALL_SLOTS];
+const HOT_CALLS: u32 = 16;
+
+/// A call to `target` found no function and goes to the fallback.
+pub(crate) fn fallback_call(target: u64) {
+    if !hot() || target == 0 {
+        return;
+    }
+    let s = ((target ^ (target >> 10)) as usize) % CALL_SLOTS;
+    let n = if CALL_PC[s].load(Ordering::Relaxed) == target {
+        CALL_N[s].fetch_add(1, Ordering::Relaxed) + 1
+    } else if CALL_N[s].load(Ordering::Relaxed) == 0 {
+        CALL_PC[s].store(target, Ordering::Relaxed);
+        CALL_N[s].store(1, Ordering::Relaxed);
+        1
+    } else {
+        // Someone else's slot: aged, as the safepoint's are.
+        CALL_N[s].fetch_sub(1, Ordering::Relaxed);
+        0
+    };
+    if n == HOT_CALLS {
+        request(target);
+    }
 }
 
 /// A safepoint at `pc` (not in the process's other mode), sampled `n` times

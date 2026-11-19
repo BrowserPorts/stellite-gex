@@ -2663,6 +2663,11 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         ));
         crate::end_process(0xc000_001d);
     }
+    // The function JIT's hot tier counts the calls that come here: one made
+    // often enough is translated (fjit.rs `fallback_call`).
+    if t != ret as u64 {
+        crate::fjit::fallback_call(t);
+    }
     // The awaited return itself, reached with the stack moved: a callee that
     // returns having changed `esp` (MSVC's `__chkstk`, `__SEH_prolog4`), whose
     // `ret` goes through the table. A call-out from there would wait for a
