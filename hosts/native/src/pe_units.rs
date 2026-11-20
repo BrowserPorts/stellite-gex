@@ -1097,6 +1097,23 @@ fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path:
             *a = 0;
         }
     }
+    // `GEX_UNIT_ENTRIES=LO:HI`: of a unit built from a function set, only
+    // the entries numbered LO up to HI are bound, the others staying on
+    // tier-1 (bisecting a unit down to the function a program fails in,
+    // without building it again).
+    static ONLY: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let only = *ONLY.get_or_init(|| {
+        let v = std::env::var("GEX_UNIT_ENTRIES").ok()?;
+        let (lo, hi) = v.split_once(':')?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    if let (Some((lo, hi)), true) = (only, path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n.contains("-s"))) {
+        for (i, a) in entries.iter_mut().enumerate() {
+            if i < lo || i >= hi {
+                *a = 0;
+            }
+        }
+    }
     Ok(Some((path.to_path_buf(), Arc::new(cwasm), entries)))
 }
 
