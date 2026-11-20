@@ -38,8 +38,8 @@ configure() { # DIR STAMP CMD...
 }
 # SRC as named, a link kept (cd, not realpath, as dist.sh takes it): Wine's
 # makedep splits a makefile's include flags at spaces, so a tree reached
-# through a spaceless link (a checkout on a volume named "T7 APFS") builds
-# only by that link's path.
+# through a spaceless link (a checkout under a directory whose name has a
+# space) builds only by that link's path.
 srcdir() {
   local d; d=$(cd "${1:?SRC}" && pwd) || exit 1
   case $d in *[[:space:]]*) echo "wine32/wine-build: $d has a space; name the Wine source by a path without one (a link)" >&2; exit 1 ;; esac

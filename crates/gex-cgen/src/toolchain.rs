@@ -359,7 +359,7 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 /// One argument of a response file, quoted: wasm-ld reads one GNU-style,
 /// splitting at whitespace outside quotes, so a path with a space (a unit
-/// cache on a volume named "T7 APFS") would be two.
+/// cache under a directory whose name has one) would be two.
 fn rsp_arg(text: &mut String, arg: &str) {
     text.push('"');
     for c in arg.chars() {
