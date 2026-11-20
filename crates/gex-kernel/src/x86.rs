@@ -800,6 +800,10 @@ pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
         0x8000_0002 => str_regs(b"gex virtual x86-"),
         0x8000_0003 => str_regs(b"64 processor    "),
         0x8000_0004 => str_regs(b"                "),
+        // The L2 cache again, as leaf 4 has it (4 MiB, 16-way, 64-byte lines),
+        // in the form AMD defined and Intel fills ecx of. Unreal Engine takes
+        // its cache line size from here alone and divides by it.
+        0x8000_0006 => [0, 0, (4096 << 16) | (8 << 12) | 64, 0],
         0x8000_0008 => [0x3030, 0, 0, 0],
         _ => [0, 0, 0, 0],
     }
