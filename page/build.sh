@@ -45,8 +45,7 @@
 #
 # $CACHE is GEX_WEB_BUILD, by default target/web-build. The packages
 # toolchain/debian-package.sh unpacks stay in the caller's store
-# (GEX_PACKAGE_CACHE, or the caller's CACHE): that store is case-sensitive,
-# and the build folder need not be.
+# (GEX_PACKAGE_CACHE, or the caller's CACHE).
 #
 # To serve both at once:
 #

@@ -10,10 +10,14 @@
 # The packages live in GEX_PACKAGE_CACHE when it is set (page/build.sh keeps
 # its caller's store there while its own CACHE is its work folder), else in
 # CACHE. Some hold paths that differ only in case (linux-libc-dev's
-# netfilter headers: xt_CONNMARK.h, a target, beside xt_connmark.h, a match),
-# so the store must be on a case-sensitive file system: on another, one of
-# each pair would overwrite the other, and unpacking such a package there is
-# refused.
+# netfilter headers: xt_CONNMARK.h, a target, beside xt_connmark.h, a match).
+# Both of each such set are left out, on every file system, so the store and
+# whatever copies from it (the sysroots' headers) can be case-insensitive and
+# every host unpacks the same files. Keeping one would be worse than keeping
+# neither: on a case-insensitive disk an include of the other name finds it
+# and reads the wrong header, where now it fails to compile. Nothing gex
+# builds includes them. (-ci in the folder's name: unpacked this way; a store
+# unpacked before, with the sets, is left alone.)
 #
 #   toolchain/debian-package.sh NAME       -> prints the unpacked root (its usr/ or opt/)
 set -eu
@@ -22,7 +26,7 @@ name=${1:?NAME}
 eval "$(sed -n "s/^\(${name}_URL\|${name}_SHA256\) *:= *\(.*\)\$/\1=\2/p" "$HERE/pins")"
 eval "url=\${${name}_URL:?no ${name}_URL in toolchain/pins} sum=\${${name}_SHA256:?no ${name}_SHA256 in toolchain/pins}"
 CACHE=${GEX_PACKAGE_CACHE:-${CACHE:-$HOME/.cache/gex}}
-dir=$CACHE/debian-$(basename "$url" .deb)-$(printf %.12s "$sum")
+dir=$CACHE/debian-$(basename "$url" .deb)-$(printf %.12s "$sum")-ci
 mkdir -p "$CACHE"
 exec 8>"$dir.lock"
 flock 8
@@ -34,19 +38,13 @@ if [ ! -f "$dir/.done" ]; then
     *.xz) z=-J ;; *.zst) z=--zstd ;; *.gz) z=-z ;; *) z= ;;
   esac
   rm -rf "$dir.tmp" && mkdir -p "$dir.tmp"
-  # A case-insensitive store would merge the package's case-only pairs.
-  touch "$dir.tmp/.case-probe"
-  if [ -e "$dir.tmp/.CASE-PROBE" ]; then
-    pairs=$(ar p "$deb" "$member" | tar -t $z | sort -f | uniq -di)
-    if [ -n "$pairs" ]; then
-      echo "debian-package: $(basename "$url") has paths that differ only in case, and $CACHE is on a case-insensitive file system; set GEX_PACKAGE_CACHE (or CACHE) to a case-sensitive one:" >&2
-      echo "$pairs" | head -5 >&2
-      rm -rf "$dir.tmp"
-      exit 1
-    fi
+  ar p "$deb" "$member" | tar -t $z | sh "$HERE/case-pairs.sh" > "$dir.case"
+  if [ -s "$dir.case" ]; then
+    echo "debian-package: $(basename "$url"): $(wc -l < "$dir.case" | tr -d ' ') paths that differ from another only in case, left out:" >&2
+    sed 's#^\./##; s#^#  #' "$dir.case" >&2
   fi
-  rm -f "$dir.tmp/.case-probe"
-  ar p "$deb" "$member" | tar -x $z -C "$dir.tmp"
+  ar p "$deb" "$member" | tar -x $z -C "$dir.tmp" -X "$dir.case"
+  rm -f "$dir.case"
   touch "$dir.tmp/.done"
   rm -rf "$dir" && mv "$dir.tmp" "$dir"
 fi

@@ -1,15 +1,16 @@
 # The build environment of a macOS host.
 #
-# The build scripts are written against GNU tools, bash 4 or later and a case-sensitive
-# file system. On macOS the tools come from Homebrew and the build folders sit on a
-# case-sensitive volume; this file names both in one place. The Makefile reads it on
-# Darwin through `--make`, which prints the settings as NAME=VALUE words. A build script
-# run by hand is run from bash after `. scripts/host-env.sh`.
+# The build scripts are written against GNU tools and bash 4 or later. On macOS the tools
+# come from Homebrew; this file names them and the build folders in one place. The
+# Makefile reads it on Darwin through `--make`, which prints the settings as NAME=VALUE
+# words. A build script run by hand is run from bash after `. scripts/host-env.sh`.
+# A case-insensitive volume does for the build folders: the only paths that differ but
+# for case in what gex unpacks (Linux's netfilter headers, xt_MARK.h beside xt_mark.h)
+# are left out as it unpacks them (toolchain/case-pairs.sh). A path with a space does not.
 #
-#   GEX_BUILD        this checkout's build folder on the case-sensitive volume (default:
-#                    the folder target/'s own link names, followed one step: target/ there
-#                    may link on to another volume, as cargo's output has no case-only
-#                    pairs), with out/, work/ and tmp/ beside it
+#   GEX_BUILD        this checkout's build folder (default: the folder target/'s own link
+#                    names, followed one step: target/ there may link on to another
+#                    volume), with out/, work/ and tmp/ beside it
 #   GEX_SHARED       what every checkout on the host shares, as a Linux host shares
 #                    ~/.cache/gex and ~/emsdk (default: shared/ beside GEX_BUILD): cache/
 #                    (CACHE), emsdk/, py/, mingw/, seeds/ and xdg-cache/
@@ -28,7 +29,7 @@
 # packaging.
 
 gex_host_env() {
-    local root hb build shared fail=0 d probe
+    local root hb build shared fail=0 d
     root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
     hb=${HOMEBREW_PREFIX:-/opt/homebrew}
 
@@ -51,15 +52,6 @@ gex_host_env() {
     case $build in
     *[[:space:]]*) echo "host-env: GEX_BUILD has a space in it: $build" >&2; return 1 ;;
     esac
-
-    # Linux sources hold names that differ only in case (xt_MARK.h, xt_mark.h)
-    probe=$(mktemp "$build/.case.XXXXXX") || return 1
-    if [ -e "$(dirname "$probe")/$(basename "$probe" | tr '[:lower:]' '[:upper:]')" ]; then
-        rm -f "$probe"
-        echo "host-env: $build is on a case-insensitive volume" >&2
-        return 1
-    fi
-    rm -f "$probe"
 
     shared=${GEX_SHARED:-$(dirname "$build")/shared}
     [ -d "$shared" ] || { echo "host-env: no shared folder $shared (GEX_SHARED)" >&2; return 1; }

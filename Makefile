@@ -112,7 +112,8 @@ NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others. Their
 # programs are i386 Linux ones: a host that does not run those (any but x86
 # Linux) uses each one's target files with its own clang and lld
-# (toolchain/musl-cross-clang.sh: TOOLCHAIN.clang).
+# (toolchain/musl-cross-clang.sh: TOOLCHAIN.clang). Their Linux headers'
+# case-only pairs are left out as they unpack (toolchain/case-pairs.sh).
 TC := $(CACHE)/toolchains
 TC_HOST := $(if $(filter Linux-x86_64 Linux-i%86,$(shell uname -s)-$(shell uname -m)),,.clang)
 GEX_TOOLCHAIN ?= $(TC)/aarch64-linux-musl-cross$(TC_HOST)
@@ -121,7 +122,9 @@ export GEX_TOOLCHAIN GEX_X86_TOOLCHAIN
 toolchains: $(foreach a,aarch64 x86_64,$(TC)/$(a)-linux-musl-cross/.pinned $(if $(TC_HOST),$(TC)/$(a)-linux-musl-cross.clang/.made))
 $(TC)/%-linux-musl-cross/.pinned:
 	$(ROOT)/wine/dl.sh $(MUSL_CROSS_$(call upper,$*)_URL) $(MUSL_CROSS_$(call upper,$*)_SHA256) $(CACHE)/dl
-	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC) && tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz
+	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC)
+	tar -tzf $(CACHE)/dl/$*-linux-musl-cross.tgz | sh $(ROOT)/toolchain/case-pairs.sh > $(TC)/$*-linux-musl-cross.case
+	tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz -X $(TC)/$*-linux-musl-cross.case && rm -f $(TC)/$*-linux-musl-cross.case
 	echo $(MUSL_CROSS_$(call upper,$*)_SHA256) > $@
 $(TC)/%-linux-musl-cross.clang/.made: $(TC)/%-linux-musl-cross/.pinned $(ROOT)/toolchain/musl-cross-clang.sh
 	$(ROOT)/toolchain/musl-cross-clang.sh $(TC)/$*-linux-musl-cross
