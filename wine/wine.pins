@@ -7,7 +7,7 @@
 # The Wine fork: wine-stellite, branch stellite (the 64-bit Wine work with Stellite's own: WoW64's
 # LPC layout, winlogon, the shared-block file copies).
 WINE64_REPO   := https://origin.cursor.com/mov/wine-stellite.git
-WINE64_COMMIT := 145797aa7f6c6b47055c0d5ec5b853ebfd9d22ef
+WINE64_COMMIT := bfe0c0b1cc99f6558b48615a177db396ce23e721
 
 # The 32-bit Wine tree (branch wasm32-w3-next): the wineserver's build, and
 # the legacy 32-bit dist (make wine32).
