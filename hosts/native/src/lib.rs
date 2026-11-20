@@ -441,8 +441,11 @@ struct Jit {
     cache: Option<(std::path::PathBuf, String)>,
     /// Instances live here because the table holds funcrefs into them.
     instances: Vec<wasmtime::Instance>,
-    /// Registry entries already instantiated into this store.
+    /// Registry entries this store has caught up on: instantiated, or for a
+    /// lazy unit only given room in the tables.
     replayed: usize,
+    /// The lazy units instantiated in this store, by module id.
+    installed: std::collections::HashSet<u64>,
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
@@ -470,6 +473,21 @@ struct CompiledUnit {
     /// and slot packed as a directory entry: addresses a function body
     /// serves.
     bridges: Vec<u32>,
+    /// A store that did not make this unit instantiates it at its first
+    /// miss into it (`install_provider`), not when it catches up: tier-1's
+    /// translations, of which a large program has tens of thousands and a
+    /// thread runs few.
+    lazy: bool,
+}
+
+/// Whether a thread instantiates tier-1's translations as it first reaches
+/// them (the default) or all of them as it catches up
+/// (`GEX_TIER1_INSTALL=eager`). A hundred threads catching up on eighty
+/// thousand modules is eight million instances: an Unreal Engine game held
+/// 24 GB of them three minutes in.
+fn lazy_tier1() -> bool {
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LAZY.get_or_init(|| std::env::var("GEX_TIER1_INSTALL").as_deref() != Ok("eager"))
 }
 
 /// Runtime translation state shared by every guest thread.
@@ -505,6 +523,9 @@ struct JitShared {
     /// translated address: a block failing its page check is translated
     /// again only while its own module still does (`PAGE_STALE`).
     provider: std::collections::HashMap<u64, u64>,
+    /// Where in `registry` each lazy unit is, by its module id: how a miss
+    /// finds the unit that provides its address.
+    by_module: std::collections::HashMap<u64, usize>,
     /// The function table's process half (`ftab`).
     ftab: ftab::Shared,
     /// A native wasm32 program (`wasmprog`): its native frames cannot be
@@ -595,6 +616,7 @@ impl JitShared {
             retired_pages: self.retired_pages.clone(),
             stale_blocks: self.stale_blocks,
             provider: self.provider.clone(),
+            by_module: self.by_module.clone(),
             ftab: self.ftab.fork_copy(),
             wasm_program: self.wasm_program,
             wine_pe: self.wine_pe.clone(),
@@ -1441,6 +1463,7 @@ fn run_program_with(
                 retired_pages: Default::default(),
                 stale_blocks: 0,
                 provider: Default::default(),
+                by_module: Default::default(),
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
@@ -1457,6 +1480,7 @@ fn run_program_with(
             cache: jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            installed: Default::default(),
             limits: xlate.limits,
             ftab: None,
         });
@@ -3176,6 +3200,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            installed: Default::default(),
             limits: cx.limits,
             ftab: None,
         });
@@ -3562,6 +3587,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            installed: Default::default(),
             limits: cx.limits,
             ftab: None,
         });
@@ -3651,11 +3677,16 @@ fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.registry[from.min(sh.registry.len())..].to_vec()
     };
+    let mut room = 0;
     for unit in &pending {
-        install_unit(&mut *store, unit)?;
+        if unit.lazy {
+            room = room.max(unit.table_slots);
+        } else {
+            install_unit(&mut *store, unit)?;
+        }
         store.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
-    Ok(())
+    grow_tables(&mut *store, room)
 }
 
 /// What `--busybox` presents (the applets toolchain/busybox/busybox.config
@@ -5890,7 +5921,7 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     let key = gex_abi::addr_key(pc, alt);
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let replayed = replay_registry(caller)?;
-        let covered = replayed && {
+        let covered = install_provider(caller, key)? || replayed && {
             let jit = caller.data().jit.as_ref().unwrap();
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.translated.contains(&key)
@@ -5901,8 +5932,10 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     // the shared registry is far cheaper than translating again, and it is
     // also how a newly spawned thread fills a table that starts out holding
     // only what the image module put there.
+    // A translation another thread made is instantiated here only now, at
+    // this thread's first miss into it (`CompiledUnit::lazy`).
     let replayed_any = replay_registry(caller)?;
-    if replayed_any && {
+    if install_provider(caller, key)? || replayed_any && {
         let jit = caller.data().jit.as_ref().unwrap();
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.translated.contains(&key)
@@ -6083,8 +6116,15 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     // whenever another thread appended between the catch-up above and this
     // push -- which is exactly what filled one store with ten thousand
     // instances of the same modules.
-    publish_unit(&shared, &translated_module, module, stats.blocks)?;
+    let unit = publish_unit(&shared, &translated_module, module, stats.blocks)?;
     replay_registry(caller)?;
+    // Its own translation, which catching up left for a first miss
+    // (`CompiledUnit::lazy`): this thread is that miss, and a page numbered
+    // for it has no directory entry until an install writes one.
+    if unit.lazy && !caller.data().jit.as_ref().is_some_and(|j| j.installed.contains(&unit.module_id)) {
+        install_unit(&mut *caller, &unit)?;
+        refresh_callouts(&mut *caller)?;
+    }
 
     // If the address that faulted did not end up with code, resuming would
     // fault again at the same place forever. Say so instead -- unless its
@@ -6196,10 +6236,47 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
         }
         sh.registry[from..].to_vec()
     };
+    let mut room = 0;
     for unit in &pending {
-        install_unit(&mut *caller, unit)?;
+        if unit.lazy {
+            room = room.max(unit.table_slots);
+        } else {
+            install_unit(&mut *caller, unit)?;
+        }
         caller.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
+    grow_tables(&mut *caller, room)?;
+    refresh_callouts(&mut *caller)?;
+    Ok(true)
+}
+
+/// Instantiate the lazy unit that provides `key` (`gex_abi::addr_key`) into
+/// this store, when it is translated and this store has not yet: a miss at
+/// code another thread translated. Whether it did. The unit's directory
+/// entries are written only where still current (`write_current_dir`), and a
+/// page retired since has no provider, so a retired translation is never
+/// brought back.
+fn install_provider(caller: &mut Caller<'_, HostState>, key: u64) -> Result<bool> {
+    let unit = {
+        let Some(jit) = caller.data().jit.as_ref() else {
+            return Ok(false);
+        };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if !sh.translated.contains(&key) {
+            return Ok(false);
+        }
+        let Some(id) = sh.provider.get(&key) else {
+            return Ok(false);
+        };
+        if jit.installed.contains(id) {
+            return Ok(false);
+        }
+        let Some(&at) = sh.by_module.get(id) else {
+            return Ok(false);
+        };
+        Arc::clone(&sh.registry[at])
+    };
+    install_unit(&mut *caller, &unit)?;
     refresh_callouts(&mut *caller)?;
     Ok(true)
 }
@@ -6228,6 +6305,8 @@ fn publish_unit(
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
         bridges: Vec::new(),
+        // By its id, which is how a miss finds it: one without stays eager.
+        lazy: lazy_tier1() && translated.module_id != 0,
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -6279,6 +6358,10 @@ fn publish_unit(
             *by.entry(*a / gex_abi::DISPATCH_PAGE).or_default() += 1;
         }
     }
+    if unit.lazy {
+        let at = sh.registry.len();
+        sh.by_module.insert(unit.module_id, at);
+    }
     sh.registry.push(Arc::clone(&unit));
     crate::REGISTRY_LEN.fetch_max(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
@@ -6306,6 +6389,20 @@ fn install_unit(
             jit.tables.clone(),
         )
     };
+    grow_tables(cx.as_context_mut(), unit.table_slots)?;
+    install_unit_grown(cx, unit, memory, linker, tables)
+}
+
+/// Give this store's dispatch tables room for `table_slots` slots, each new
+/// one a miss: what a unit needs before it is instantiated, and all a lazy
+/// unit gets until a thread reaches it.
+fn grow_tables(mut cx: impl wasmtime::AsContextMut<Data = HostState>, table_slots: u64) -> Result<()> {
+    if table_slots == 0 {
+        return Ok(());
+    }
+    let Some(tables) = cx.as_context().data().jit.as_ref().map(|j| j.tables.clone()) else {
+        return Ok(());
+    };
     // Slots are allocated in one space that spans every table, so the figure
     // the unit carries is a running total and each table's share is that
     // total clamped to its own window.
@@ -6314,7 +6411,7 @@ fn install_unit(
         .get(cx.as_context_mut(), 0)
         .ok_or_else(|| anyhow!("dispatch table is empty"))?;
     for (i, t) in tables.iter().enumerate() {
-        let want = (unit.table_slots as u64)
+        let want = table_slots
             .saturating_sub(i as u64 * per)
             .min(per);
         let have = t.size(cx.as_context_mut());
@@ -6331,7 +6428,17 @@ fn install_unit(
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
     }
+    Ok(())
+}
 
+/// [`install_unit`] once the tables have its slots.
+fn install_unit_grown(
+    mut cx: impl wasmtime::AsContextMut<Data = HostState>,
+    unit: &CompiledUnit,
+    memory: gex_mem::GuestMemory,
+    linker: Linker<HostState>,
+    tables: Vec<Table>,
+) -> Result<()> {
     if unit.module.is_none() {
         // Bridges only: tier-1's slots for addresses a function serves.
         ftab::install_bridges(cx.as_context_mut(), &unit.bridges)?;
@@ -6405,13 +6512,12 @@ fn install_unit(
     // Only entries still current: replaying an old unit into a new store
     // must not point a page retired since back at its abandoned slots.
     write_current_dir(&cx, memory, unit)?;
-    cx.as_context_mut()
-        .data_mut()
-        .jit
-        .as_mut()
-        .unwrap()
-        .instances
-        .push(instance);
+    let mut c = cx.as_context_mut();
+    let jit = c.data_mut().jit.as_mut().unwrap();
+    jit.instances.push(instance);
+    if unit.lazy {
+        jit.installed.insert(unit.module_id);
+    }
     Ok(())
 }
 

@@ -199,10 +199,45 @@ pub fn set_functions(functions: Option<std::collections::BTreeSet<u64>>) {
     *FUNCTIONS.lock().unwrap() = functions;
 }
 
+/// The functions the unit of the image keyed `image` is made of, when not
+/// all of them: this process's ([`set_functions`]), else the set the image's
+/// unit was last built from here, which a build writes beside the units as
+/// `sets/<image key>`. That is how a run, which is given no set, finds the
+/// unit `gexc cgen-image --functions` built for an image and leaves every
+/// other image on its whole unit. Read once per image.
+fn functions_of(image: &str) -> Option<Arc<std::collections::BTreeSet<u64>>> {
+    if let Some(only) = FUNCTIONS.lock().unwrap().as_ref() {
+        return Some(Arc::new(only.clone()));
+    }
+    static SETS: Mutex<Option<HashMap<String, Option<Arc<std::collections::BTreeSet<u64>>>>>> = Mutex::new(None);
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    sets.get_or_insert_with(HashMap::new)
+        .entry(image.to_string())
+        .or_insert_with(|| {
+            let text = std::fs::read_to_string(cache_root().ok()?.join("sets").join(image)).ok()?;
+            Some(Arc::new(text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()))
+        })
+        .clone()
+}
+
+/// Write down the set this process builds `image`'s unit from
+/// ([`functions_of`] reads it back in a run).
+fn remember_functions(image: &str) -> Result<()> {
+    let Some(only) = FUNCTIONS.lock().unwrap().clone() else { return Ok(()) };
+    let dir = cache_root()?.join("sets");
+    std::fs::create_dir_all(&dir)?;
+    let text: String = only.iter().map(|a| format!("{a:x}\n")).collect();
+    std::fs::write(dir.join(image), text).with_context(|| format!("writing the function set of {image}"))?;
+    // The keys runs remembered (`remembered_unit_key`) were made without
+    // this set: forgotten, so the next run works them out again.
+    let _ = std::fs::remove_dir_all(cache_root()?.join("w3keys"));
+    Ok(())
+}
+
 fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
     use std::hash::{Hash, Hasher};
     let mut key = image_key(image);
-    if let Some(only) = FUNCTIONS.lock().unwrap().as_ref() {
+    if let Some(only) = functions_of(&key) {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         only.hash(&mut h);
         key = format!("{key}-s{:016x}", h.finish());
@@ -879,6 +914,7 @@ fn prepare_with(
     let root = cache_root()?;
     let dir = root.join(&key);
     let out = dir.join("c.wasm");
+    remember_functions(&image_key(image))?;
     if out.exists() {
         return Ok(out);
     }
@@ -921,7 +957,7 @@ fn prepare_with(
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().chain(&pv.twins).copied().collect();
     let hints = icall_hints(image);
-    let only: Option<std::collections::HashSet<u64>> = FUNCTIONS.lock().unwrap().as_ref().map(|s| s.iter().copied().collect());
+    let only: Option<std::collections::HashSet<u64>> = functions_of(&image_key(image)).map(|s| s.iter().copied().collect());
     let stats = gex_cgen::image::build_c_module_only(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, only.as_ref())?;
     // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
     if std::env::var_os("GEX_CGEN_KEEP").is_none() {
@@ -1059,6 +1095,23 @@ fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path:
     for a in entries.iter_mut() {
         if stubs.binary_search(a).is_ok() {
             *a = 0;
+        }
+    }
+    // `GEX_UNIT_ENTRIES=LO:HI`: of a unit built from a function set, only
+    // the entries numbered LO up to HI are bound, the others staying on
+    // tier-1 (bisecting a unit down to the function a program fails in,
+    // without building it again).
+    static ONLY: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let only = *ONLY.get_or_init(|| {
+        let v = std::env::var("GEX_UNIT_ENTRIES").ok()?;
+        let (lo, hi) = v.split_once(':')?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    if let (Some((lo, hi)), true) = (only, path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n.contains("-s"))) {
+        for (i, a) in entries.iter_mut().enumerate() {
+            if i < lo || i >= hi {
+                *a = 0;
+            }
         }
     }
     Ok(Some((path.to_path_buf(), Arc::new(cwasm), entries)))
