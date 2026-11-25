@@ -6,7 +6,56 @@
 import { noteFetch } from './fetch-note.mjs';
 import { logNamed } from './log.mjs';
 import { lateZstd } from './zstd-late.mjs';
-import { CHUNK, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
+import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, lazyOwnerOnly, FailedFrames, retrySync } from './lazy-cache.mjs';
+
+// The background fill (app.js `fill`): lazy files the page downloads, packed
+// one after another in one stream, while the guest runs. `buf` (a
+// SharedArrayBuffer) holds them as decoded so far, `at` (an Int32Array on a
+// SharedArrayBuffer) how many bytes of `buf` are there (-1: the fill failed),
+// `files` their URL paths and where each starts. A read of one of them waits
+// for its bytes here instead of asking the server for them (a second download
+// of the same bytes, beside the fill's, on the same link).
+let fill = null;
+export function setFill(f) {
+  if (!f?.buf || !f?.at || !f?.files) return;
+  fill = { buf: new Uint8Array(f.buf), at: f.at, files: new Map(f.files.map(([path, off, size]) => [path, [off, size]])) };
+}
+// Wait until the fill holds `end` bytes; false if it failed or stalled. A
+// wait is noted (`what`, the file it is for), as a fetch is.
+function fillHas(end, what) {
+  let done = null;
+  try {
+    for (;;) {
+      const at = Atomics.load(fill.at, 0);
+      if (at < 0) return false;
+      if (at >= end) return true;
+      done ??= noteFetch(`fill:${what}`, end - at);
+      // Workers may block; the page's thread never reads lazy files.
+      if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return false;
+    }
+  } finally {
+    done?.();
+  }
+}
+/** A fill entry that is not a lazy file (`unit:KEY/c.wasm`, a late unit's
+ *  file: eject-site.mjs --late), once its bytes are there; an unshared copy,
+ *  or null when the fill has no such entry. */
+export function fillFile(name) {
+  const f = fill?.files.get(name);
+  if (!f || !fillHas(f[0] + f[1], name)) return null;
+  return fill.buf.slice(f[0], f[0] + f[1]);
+}
+function fromFill(href, from, memory, dst, len) {
+  if (!fill) return -1;
+  let path;
+  try { path = decodeURIComponent(new URL(href, 'http://x').pathname); } catch { return -1; }
+  const f = fill.files.get(path);
+  if (!f || from + len > f[1]) return -1;
+  const end = f[0] + from + len;
+  if (!fillHas(end, path)) return -1;
+  new Uint8Array(memory.buffer, dst, len).set(fill.buf.subarray(f[0] + from, end));
+  return len;
+}
 
 // Under Node (run-node.mjs --lazy, tests only): a lazy file's URL is a host
 // path, read here; GEX_LAZY_DELAY_MS holds each fetch back, as a slow link
@@ -33,7 +82,7 @@ function nodeFetch(href, from, memory, dst, len) {
   }
 }
 
-// A rest bundle: the lazy files as one tar, its
+// A site's rest bundle (site/eject-site.mjs): the lazy files as one tar, its
 // stream cut into independent zstd frames of one size (the last shorter), and
 // beside it an index (BUNDLE.json: `frame`, the frames' unpacked size, and
 // `frames`, each one's [offset, length] in BUNDLE). A lazy file in it has the
@@ -46,11 +95,12 @@ let zstd = null;
 let zstdLoad = null;
 /** The decoder the rest bundle's reads need, loaded and set up (a read
  *  cannot wait for it: the Worker's guest runs synchronously). The Worker
- *  awaits this before its kernel starts. None where the lazy files have no
- *  rest bundle (the page says, `GEX_REST_BUNDLE`), or where the page's lazy
- *  source reads them (lazy-cache.mjs). Compiled here; its instance (and
- *  memory), an engine memory reservation, only at a first decode
- *  (zstd-late.mjs). */
+ *  awaits this before its kernel starts. None where the site has no rest
+ *  bundle (the page says, `GEX_REST_BUNDLE`), or where the page's lazy-file
+ *  owner reads it for every Worker (lazy-cache.mjs): a decoder is an engine
+ *  memory reservation, and one in each of a desktop's Workers ran the page
+ *  out of them. Compiled here; its instance (and memory) only at a first
+ *  decode (zstd-late.mjs). */
 export function lazyReady() {
   if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
   zstdLoad ??= lateZstd(import('../../../runtime/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../runtime/vendor/zstddec/zstddec.wasm', import.meta.url).href)
@@ -71,7 +121,8 @@ function sayOnce(key, line) {
 }
 // A host that ignores Range answers a ranged read with the whole file (200):
 // kept here, URL -> its bytes, and later ranges of it cut from that, not
-// downloaded whole again a read (once a Worker).
+// downloaded whole again a read. (Without the page's cache owner, so once a
+// Worker; with it, lazy-cache-worker.js keeps one for the page.)
 const wholes = new Map();
 function keptWhole(url, x, b) {
   if (x.status !== 200 || wholes.has(url)) return;
@@ -119,7 +170,8 @@ function bundleRead(href, from, memory, dst, len) {
   const url = h.slice(0, cut);
   const start = Number(h.slice(cut + 1)) + from;
   if (!zstd) {
-    sayOnce(url, `[lazy] ${url}: the zstd decoder is not loaded (lazyReady)`);
+    // (none by design where the page's owner reads for every Worker)
+    if (!lazyCacheOn()) sayOnce(url, `[lazy] ${url}: the zstd decoder is not loaded (lazyReady)`);
     return -1;
   }
   const b = bundleIndex(url);
@@ -330,8 +382,8 @@ export function lazyFetch(memory) {
     return n;
   };
 }
-/** `?systime=1`: this Worker's lazy reads so far, by kind (source, bundle,
- *  xhr): [reads, ms, bytes]. */
+/** `?systime=1`: this Worker's lazy reads so far, by kind (fill, bundle,
+ *  cache, xhr): [reads, ms, bytes]. */
 export const lazyStats = {};
 let readKind = 'xhr';
 function lazyRead(memory) {
@@ -339,11 +391,16 @@ function lazyRead(memory) {
     url >>>= 0; urlLen >>>= 0; dst >>>= 0; len >>>= 0;
     const from = Number(offset);
     const href = new TextDecoder().decode(new Uint8Array(memory.buffer, url, urlLen).slice());
+    if (fill) {
+      readKind = 'fill';
+      const n = fromFill(href, from, memory, dst, len);
+      if (n >= 0) return n;
+      readKind = 'xhr';
+    }
     const done = noteFetch(href, len);
     // The page's own source (fs.js setLazySource): the key is its, and the
     // owner is the only one who can read it.
-    if (lazyCacheOn()) {
-      readKind = 'source';
+    if (lazyOwnerOnly()) {
       const c = cachedRead(href, from, dst, len);
       done(c === len ? len : 0);
       if (c !== len) sayOnce(href, `[lazy] ${href.replace(/^\/=/, '')} @${from}+${len}: the page's lazy source failed`);
@@ -351,10 +408,24 @@ function lazyRead(memory) {
     }
     if (href.includes('#')) {
       readKind = 'bundle';
+      // The owner's decoder, when the page has one; this Worker's own if not.
+      const c = cachedRead(absolute(href), from, dst, len);
+      if (c === len) {
+        done(len);
+        return len;
+      }
       const n = bundleRead(href, from, memory, dst, len);
       done(n > 0 ? n : 0);
       if (n < 0) sayOnce(href, `[lazy] ${href}: a read failed (rest bundle)`);
       return n;
+    }
+    // The page's cache of lazy files, when it keeps one (lazy-cache.mjs):
+    // its answer, or its failure (it tried the server already).
+    const c = cachedRead(absolute(href), from, dst, len);
+    if (c === len) readKind = 'cache';
+    if (c === len || c === OWNER_FAILED) {
+      done(c === len ? len : 0);
+      return c === len ? len : -1;
     }
     if (typeof XMLHttpRequest !== 'function') {
       const n = nodeFetch(href, from, memory, dst, len);

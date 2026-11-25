@@ -112,6 +112,20 @@ function unitModuleWorker(zstd) {
   };
 }
 
+/** A unit's Module from its plain URL, compiled off the guest's threads. */
+async function plainUnitModule(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return WebAssembly.compile(await r.arrayBuffer());
+}
+
+/** `fetchUnit`, but a unit the fill brings (`late`: key to its Module's
+ *  promise) from there: one download of it, not two. */
+function lateFirst(late, fetchUnit) {
+  if (!late?.size) return fetchUnit;
+  return (url) => late.get(url.split('/').at(-2)) ?? fetchUnit(url);
+}
+
 async function fetchBytes(url, onProgress) {
   // Revalidated, never taken from cache on faith: the shim and seed have fixed
   // URLs with no content hash, so a browser would keep serving a broken build
@@ -203,7 +217,7 @@ export function primeRuntime(r) {
   if (r?.fetchOther) fetchOther = r.fetchOther;
   if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
   if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
-  // A page may fetch the kernel itself too.
+  // An ejected site's page fetches the kernel through its pack too (app.js).
   if (r?.kernelBytes && !kernelBytes) kernelBytes = r.kernelBytes;
 }
 
@@ -568,12 +582,12 @@ export function glStarter(compositor, glChannel, { dom, backend = 'wgpu', source
 /**
  * The process host every guest process runs under (host.mjs): its Worker
  * pool, the runtime's modules, and the switches each Worker takes (`extra`).
- * `o` is what of the system's options it needs, and the channels made for
+ * `o` is what of `runProgram`'s options it needs, and the channels made for
  * the page's devices; `on` its callbacks (ProcessHost's `onOutput`,
  * `onExit`, `readStdin`, `onMessage`).
  */
 export async function makeProcessHost({
-  kernel, closure = null, heartbeat = defaultHeartbeat(), lazyCache = null, pageFs = null,
+  kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
   restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
   closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
   netChannel = null, network = null, winsize,
@@ -583,9 +597,10 @@ export async function makeProcessHost({
   const host = new ProcessHost({
   makeWorker: makeGuestWorker,
   // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
-  // Worker of its own, off this thread.
-  unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
-    ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : null,
+  // Worker of its own, off this thread. A late unit (app.js: the fill's, or
+  // a page's own by URL) is the page's Module, compiled while the guest runs.
+  unitModule: globalThis.GEX_CGEN && ((globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD) || lateUnits?.size)
+    ? lateFirst(lateUnits, globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : plainUnitModule) : null,
   shim: shimBytes,
   // The closure's image module in place of the seed: it holds the program's
   // own text, already lifted.
@@ -613,6 +628,7 @@ export async function makeProcessHost({
     // In `extra` so every Worker gets it, not only pid 1: the interesting
     // process is the X server and the client it forks, not the demo's shell.
     heartbeat: heartbeat || undefined,
+    fill: fill || undefined,
     lazyCache: lazyCache || undefined,
     pageFs: pageFs || undefined,
     restBundle: restBundle || undefined,
@@ -668,7 +684,7 @@ export async function makeProcessHost({
     // with no units; `?providers=0` runs glibc's
     // own code translated instead.
     // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-    cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined })
+    cgen: globalThis.GEX_CGEN && !tso() ? unitsAt({ mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD), zst: globalThis.GEX_CGEN_ZST ? true : undefined, late: globalThis.GEX_CGEN_LATE })
       : flag('providers') === '0' ? undefined
       : { mode: 8, url: assetUrl('/gex/cgen'), files: assetFiles('/gex/cgen/') },
     // `?aot=1`: an ejected project's run, with no run-time translation (a

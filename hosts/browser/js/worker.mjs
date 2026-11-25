@@ -77,7 +77,7 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
+import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
 import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
@@ -749,6 +749,12 @@ async function handle(msg) {
     // page's server only, not the page's own preloaded files.
     prefetchUnit(key) {
       const c = msg.cgen;
+      // A late unit (app.js: one the page names by its own URL, compiling it
+      // while the guest runs): the host hands its Module over when it is in.
+      if (c?.late?.[key] && !preFiles.has(`${key}/c.wasm`)) {
+        port.post({ kind: 'prefetchUnit', key, url: c.late[key] });
+        return;
+      }
       if (!c?.url || preClosed || preFiles.has(`${key}/c.wasm`)) return;
       let url;
       try { url = new URL(`${c.url}/${key}/c.wasm${c.zst ? '.zst' : ''}`, globalThis.location?.href).href; } catch { return; }
@@ -820,6 +826,25 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
+      // A late unit's (eject-site.mjs --late), in the fill: a Worker started
+      // before the page had compiled it waits for its bytes there.
+      const late = fillFile(`unit:${rel}`);
+      if (late) return late;
+      // A late unit's module wanted before the page's compiled one reached
+      // this Worker: its bytes from its own URL, here.
+      const lateUrl = rel.endsWith('/c.wasm') ? c.late?.[rel.slice(0, -'/c.wasm'.length)] : null;
+      if (lateUrl) {
+        const x = new XMLHttpRequest();
+        x.open('GET', lateUrl, false);
+        x.responseType = 'arraybuffer';
+        const done = noteFetch(`unit:${rel}`, 0, this.owner);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
+        return x.status === 200 ? new Uint8Array(x.response) : null;
+      }
       if (preClosed) return null;
       if (unitFiles.has(rel)) {
         const b = unitFiles.get(rel);
@@ -900,7 +925,10 @@ async function handle(msg) {
   if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
-  // The page's lazy source (fs.js setLazySource, lazy-cache.mjs).
+  // Lazy files the page is filling in the background (app.js `fill`): their
+  // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
+  if (msg.fill) setFill(msg.fill);
+  // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
   // The directories the page serves (runtime fs.mount, page-fs.mjs).
   if (msg.pageFs) setPageFs(msg.pageFs);

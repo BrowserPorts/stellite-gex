@@ -501,9 +501,13 @@ export class System extends EventTarget {
     this.#restBundle = !lazySource && opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
     const stops = [];
     // A lazy source's Worker owns the lazy files when the page set one
-    // (fs.js setLazySource): every Worker's read asks it. Without one, each
-    // Worker reads a lazy file for itself, by ranged requests.
-    const lazyCache = lazySource ? await this.#lazySourceOwner(kernel, this.#parts.get('filesystem')[INTERNAL], stops) : null;
+    // (fs.js setLazySource): every Worker's read asks it. So does the owner
+    // a preset made already (app.js: runtime/src/host/lazy-cache-worker.js,
+    // which keeps what it fetched in Cache Storage and downloads the rest
+    // bundle ahead). Without either, each Worker reads a lazy file for
+    // itself, by ranged requests.
+    const lazyCache = lazySource ? await this.#lazySourceOwner(kernel, this.#parts.get('filesystem')[INTERNAL], stops)
+      : this.#preset.host.lazyCache ?? null;
     this.#mark('lazy owner');
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
