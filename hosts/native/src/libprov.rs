@@ -632,7 +632,8 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // The memory gex mapped for native modules (their data, heaps,
     // stacks) from the `from`th on, as (start, end) u32 pairs at `out`, at
     // most `max`: how many there are in all. Wine's ntdll makes a view of
-    // each (`MemoryMap::note_host_data`).
+    // each, and drops it at a range listed again the other way round,
+    // `(end, start)`: unmapped since (`MemoryMap::host_data`).
     linker.func_wrap(IMPORT_MODULE, "host_data", |mut caller: Caller<'_, HostState>, from: i32, out: i32, max: i32| -> i32 {
         let ranges = caller.data_mut().with_kernel(|k| k.mem.lock().host_data().to_vec());
         let Some(m) = caller.data().memory.clone() else { return 0 };

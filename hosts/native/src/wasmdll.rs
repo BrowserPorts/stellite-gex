@@ -1083,6 +1083,19 @@ fn install_module(
             let b = match (own, theirs, s.wine_pe_canon.get(&(is64, name.clone())).copied()) {
                 (Some(k), _, _) => crate::dylink::NBind::OwnSlot(k),
                 (None, Some(v), _) => crate::dylink::NBind::Global(v),
+                // a weak name nothing defines, in a module other than the
+                // core (a program's or DLL's: `if (&f)`, C++'s thread_local
+                // init functions): null, as on the page. The core's weak C
+                // mains stay late slots, which the program fills.
+                (None, None, None)
+                    if pm.weak.contains(&name)
+                        && !name.contains('!')
+                        && !mine.contains(&name)
+                        && others.get(&name).is_none()
+                        && file.file_name().is_some_and(|n| n != CORE_MODULE) =>
+                {
+                    crate::dylink::NBind::Global(0)
+                }
                 (None, None, c) => match c {
                 Some((owner, off)) => {
                     let base = s.ftab.map.installs().iter().find(|x| x.module == owner).map(|x| x.base);

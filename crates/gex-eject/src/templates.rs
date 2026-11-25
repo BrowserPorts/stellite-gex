@@ -16,7 +16,7 @@ pub fn build_sh() -> String {
 #      build/modules, check every replacement in user/eject.json against the
 #      objects' hashes and symbols, and assemble build/rootfs (rootfs/ plus
 #      user/files/), and with a browser runtime (runtime/web), the web build
-#      in build/web for run.mjs and index.html.
+#      in build/web for run.mjs.
 #
 # Environment: CLANG, WASM_LD (default clang, wasm-ld), USER_CFLAGS, USER_LDFLAGS
 # (wasm-ld flags).

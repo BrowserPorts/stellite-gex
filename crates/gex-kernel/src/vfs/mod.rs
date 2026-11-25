@@ -1134,6 +1134,29 @@ impl std::ops::Deref for Vfs {
     }
 }
 
+/// The guest's own `/dev/shm` (shm_open's: a [`TmpFs`]) over the host
+/// directory `host` (the host's `/dev/shm`, when the guest's root is the
+/// host's): each directory already in `host` (a ramdisk work tree, such as
+/// a test's dist copy or a program run from there) is mounted at
+/// `<at>/<name>` as the host's, so a host path the guest is handed still
+/// opens. Before this, the TmpFs hid all of them, and a Wine whose dist was on
+/// tmpfs failed with "could not load ntdll.so". Files directly in `host`
+/// (other programs' shm objects) stay hidden, and a directory made there
+/// after start is the guest's own. Symlinks to directories count as
+/// directories.
+#[cfg(unix)]
+pub fn mount_dev_shm(vfs: &mut Vfs, at: &str, host: &std::path::Path) {
+    vfs.mount(at, Arc::new(TmpFs::new()));
+    let Ok(dir) = std::fs::read_dir(host) else { return };
+    for e in dir.flatten() {
+        let (path, name) = (e.path(), e.file_name());
+        let Some(name) = name.to_str() else { continue };
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+            vfs.mount(&format!("{}/{name}", at.trim_end_matches('/')), Arc::new(HostFs::new(path)));
+        }
+    }
+}
+
 impl Vfs {
     pub fn new() -> Vfs {
         let ns = Namespace::new();
@@ -2059,6 +2082,27 @@ mod tests {
         assert_eq!(parent_of("/a"), "/");
         assert_eq!(basename("/a/b/c"), "c");
         assert_eq!(basename("c"), "c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_shm_keeps_the_hosts_directories() {
+        let host = std::env::temp_dir().join(format!("gex-shm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host);
+        std::fs::create_dir_all(host.join("work/dist")).unwrap();
+        std::fs::write(host.join("work/dist/ntdll.so"), b"elf").unwrap();
+        std::fs::write(host.join("other.shm"), b"x").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.mount("/", Arc::new(TmpFs::new()));
+        mount_dev_shm(&mut vfs, "/dev/shm", &host);
+        // the host's directory, through the guest's /dev/shm
+        assert!(vfs.metadata("/dev/shm/work/dist/ntdll.so").is_ok());
+        assert!(vfs.open("/dev/shm/work/dist/ntdll.so", 0, 0).is_ok());
+        // a host shm object stays hidden; the guest's own go to its TmpFs
+        assert!(vfs.metadata("/dev/shm/other.shm").is_err());
+        assert!(vfs.open("/dev/shm/mine", 0o102, 0o600).is_ok());
+        assert!(!host.join("mine").exists());
+        std::fs::remove_dir_all(&host).unwrap();
     }
 
     #[test]

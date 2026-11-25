@@ -44,8 +44,9 @@ export const kuser = (compact) => [
 /** USER on the null driver: window procs entered from NtUser* calls,
  *  messages between threads (user_win), a window proc's exceptions
  *  (wndproc_seh, wndproc_uncaught), two levels of calls into Wine with
- *  traps out of the inner one (nestsp). */
-export const NULLDRV = ['user_win', 'wndproc_seh', 'nestsp', 'wndproc_uncaught'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe`, nullDriver: true }));
+ *  traps out of the inner one (nestsp), a caption kept in the work area
+ *  (capkeep). */
+export const NULLDRV = ['user_win', 'wndproc_seh', 'nestsp', 'wndproc_uncaught', 'capkeep'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe`, nullDriver: true }));
 
 /** Run `cases` with `o` on top, each named `pre` + its name. */
 export async function each(w, cases, o = {}, pre = '') {
@@ -285,6 +286,27 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('shmview')) {
+    // two views of one section in one process are one range, the ended
+    // threads' TLS gone from Wine's views; a based view is the expected copy
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'shmview.c'), 'shmview.exe', ['-O2']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      t.check(`${pre}shmview: build`, false, String(e.message));
+    }
+    const tls = 'shmview: 0 of 8 ended threads\' TLS still committed\n';
+    for (const m of ['same', 'whole', 'shifted']) {
+      if (exe) await w.nt({ ...o, name: `${pre}shmview-${m}`, exe, extra: [`${exe}.wasm`], args: [m, '5'],
+        want: new RegExp(`${tls}shmview: views one range\nshmview: ${m} [1-9]\\d* records, 0 bad\n0 failures`) });
+    }
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-rdonly`, exe, extra: [`${exe}.wasm`], args: ['rdonly', '1'],
+      want: new RegExp(`${tls}shmview: rdonly views one range, written through the second read through the first\n` +
+        'shmview: rdonly first view reports PAGE_READWRITE \\(one range, one protection: an expected gap\\)\n0 failures') });
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-big`, exe, extra: [`${exe}.wasm`], args: ['big', '1'],
+      want: new RegExp(`${tls}shmview: big views one range\n0 failures`) });
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-based`, exe, extra: [`${exe}.wasm`], args: ['based', '1'],
+      want: new RegExp(`${tls}shmview: based views two ranges \\(a separate copy, as expected\\)\n0 failures`) });
+  }
   if (want('owndll')) {
     // a program linked against its own DLL's import library (the DLL
     // without a .def: its default-visibility symbols are its exports):
@@ -371,6 +393,35 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     // and on the page's loader (hosts/browser/src/cgen/wasmdll.rs)
     await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
   }
+  if (want('wkfunc')) {
+    // weak undefined functions are null, not stubs: a C weak declaration
+    // nobody defines, C++'s thread_local init function (_ZTH*), which the
+    // TLS wrapper calls only when it is non-null (ANGLE's
+    // gCurrentValidContext), and a DLL's weak reference (wkweak)
+    let exe, weakDll, strongExe;
+    try {
+      weakDll = await w.gexccWin(join(F, 'wkweak.c'), 'wkweak.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libwkweak.a')}`]);
+      // (the thread_local's definition in its own translation unit)
+      exe = await w.gexccWin(join(F, 'wkfunc.cpp'), 'wkfunc.exe', ['-O2', join(F, 'wkfunc2.cpp'), `-L${w.work}`, '-lwkweak']);
+      strongExe = await w.gexccWin(join(F, 'wkstrongexe.c'), 'wkstrongexe.exe', ['-O2'], { env: { GEXCC_WIN_UNDEFINED: 'stub' } });
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}wkfunc: build`, false, String(e.message));
+    }
+    // a strong reference to the same name in another module is still an
+    // undefined reference: another module's weak one does not excuse it
+    let refused = '';
+    try { await w.gexccWin(join(F, 'wkstrong.c'), 'wkstrong.dll', ['-O2', '-shared']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      refused = String(e.message);
+    }
+    t.check(`${pre}wkfunc: strong reference refused`, /undefined reference to `wkx'/.test(refused), refused || 'it linked');
+    await w.nt({ want: /wkfunc: null 5 0/, ...o, name: `${pre}wkfunc`, exe, extra: [`${exe}.wasm`, weakDll, `${weakDll}.wasm`] });
+    await w.nt({ want: /wkfunc: null 5 0/, ...o, name: `${pre}wkfunc-page`, exe, extra: [`${exe}.wasm`, weakDll, `${weakDll}.wasm`], page: {} });
+    // and a strong one, stubbed, is never a silent null (natively or on the page)
+    await w.nt({ want: /wkstrong: set/, ...o, name: `${pre}wkstrong`, exe: strongExe, extra: [`${strongExe}.wasm`] });
+    await w.nt({ want: /wkstrong: set/, ...o, name: `${pre}wkstrong-page`, exe: strongExe, extra: [`${strongExe}.wasm`], page: {} });
+  }
   if (want('fficall')) {
     // gexcc-win's libffi: native function values (gex.ffi_thunk's thunks)
     // and guest ones (GetProcAddress), mixed scalars and structs by value
@@ -440,7 +491,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     const o3 = await w.gexccWin(w3, 'wmain3.o', ['-O1', '-c']);
     await one('wmain3', o3, ['-municode'], { code: 43, want: /wmain3 ok 1 env/ });
   }
-  if (!want('xthr') && !want('xhoist')) return;
+  if (!want('xthr') && !want('xhoist') && !want('lazylate')) return;
   // xthr_dll.dll beside both
   let dll;
   try { dll = await w.gexccWin(join(F, 'xthr_dll.c'), 'xthr_dll.dll', ['-O2', '-shared', join(F, 'xthr_dll.def')]); } catch (e) {
@@ -448,6 +499,14 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     return t.check(`${pre}xthr_dll: build`, false, String(e.message));
   }
   for (const n of ['xthr', 'xhoist']) await one(n, join(F, `${n}.c`), ['-O2'], { extra: [dll, `${dll}.wasm`] });
+  if (!want('lazylate')) return;
+  // lazylate_dll.dll beside it: loaded once its threads run
+  let ldll;
+  try { ldll = await w.gexccWin(join(F, 'lazylate_dll.c'), 'lazylate_dll.dll', ['-O2', '-shared', join(F, 'lazylate_dll.def')]); } catch (e) {
+    if (e instanceof Skip) throw e;
+    return t.check(`${pre}lazylate_dll: build`, false, String(e.message));
+  }
+  await one('lazylate', join(F, 'lazylate.c'), ['-O2'], { extra: [ldll, `${ldll}.wasm`] });
 }
 
 /**

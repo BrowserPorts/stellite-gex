@@ -41,7 +41,7 @@ if (isMainThread) {
       if (spec.startsWith('@gex/')) return { url: ${JSON.stringify(here)} + spec.slice(5), shortCircuit: true };
       return next(spec, ctx);
     }`)}`);
-  const { Sockets } = await import(gexUrl('page/src/net.js'));
+  const { Sockets } = await import(gexUrl('runtime/src/host/net.js'));
   const { makeNetChannel, serveNet } = await import(gexUrl('hosts/browser/js/net-bridge.mjs'));
   // A stand-in network: each connection's far end, driven from here.
   const net = new Sockets({

@@ -26,7 +26,7 @@ export default async function (t) {
   await asio(t, w, o, pre);
   await each(w, ['fromaddr', 'hostdata', 'stalebind', 'dllreload'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe` })), o, pre);
   try {
-    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr', 'exitshape', 'bigdata', 'modcase', 'fontset', 'glyphs', 'owndll', 'vtdecl', 'imagebase']);
+    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'lazylate', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr', 'exitshape', 'bigdata', 'modcase', 'fontset', 'glyphs', 'owndll', 'vtdecl', 'imagebase']);
   } catch (e) {
     if (!(e instanceof Skip)) throw e;
     t.say(`${pre}gexcc-win: ${e.message}`);

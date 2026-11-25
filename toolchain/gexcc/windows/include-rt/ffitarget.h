@@ -21,8 +21,7 @@ typedef enum ffi_abi
     FFI_DEFAULT_ABI = FFI_WIN64
 } ffi_abi;
 
-/* (declared, so a caller builds; ffi_prep_closure_loc says FFI_BAD_ABI
- * until gex mints closures) */
+/* (rt/ffi.c: each closure's address bound to one entry) */
 #define FFI_CLOSURES 1
 #define FFI_GO_CLOSURES 0
 #define FFI_TRAMPOLINE_SIZE 32

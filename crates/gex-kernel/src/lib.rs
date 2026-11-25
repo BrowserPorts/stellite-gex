@@ -240,6 +240,17 @@ impl<'a> GuestMem<'a> {
         self.write(addr, &v.to_le_bytes())
     }
 
+    /// A 4-byte word read with one atomic load, for a word another
+    /// thread changes under us: a futex word, checked before a wait. An
+    /// address not 4-byte aligned is read as [`Self::read_u32`] reads it.
+    pub fn load_u32(&self, addr: u64) -> Result<u32, Errno> {
+        let b = self.read(addr, 4)?;
+        Ok(match gex_atomic::load_word(b) {
+            Some(w) => u32::from_le(w),
+            None => u32::from_le_bytes(b.try_into().unwrap()),
+        })
+    }
+
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
         let b: [u8; 4] = self.read(addr, 4)?.try_into().unwrap();
         Ok(u32::from_le_bytes(b))

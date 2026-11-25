@@ -1,5 +1,5 @@
 // The guest's network, reached from a Worker. The page holds the sockets
-// (page/src/net.js) over its network; every guest Worker calls it across a `SharedArrayBuffer` with
+// (runtime/src/host/net.js) over its network; every guest Worker calls it across a `SharedArrayBuffer` with
 // `Atomics.wait`, the way gl-bridge.mjs reaches the page's GL device.
 //
 // Why not a WebSocket in each Worker, as before: its bytes arrive as messages

@@ -5,7 +5,7 @@
 // Wine). Each file keeps its own bytes through a write to either and the
 // source's deletion; the written copy, synced, reads back whole after a
 // reload.
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 import { bootWine, WINE } from '../lib/wine.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800 };

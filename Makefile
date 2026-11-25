@@ -15,8 +15,7 @@
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 #   WINE32_CACHE  32-bit Wine's sysroot, libraries and build tree (default CACHE/wine32)
-#   PAGE_FLAGS more page/build.sh flags for make page / page-sp (--no-assets after
-#            make assets, --debug)
+#   FLAVOUR  make mesa's and make xwayland's build: --mp (default), --sp or --both
 #   GEX_TOOLCHAIN, GEX_X86_TOOLCHAIN  musl cross toolchains to use instead of the
 #            pinned ones make toolchains fetches
 
@@ -55,27 +54,24 @@ SYSROOT64 := $(OUT)/sysroot64-$(call short,$(MUSL64_COMMIT))
 BUSYBOX := $(OUT)/busybox/busybox-$(BUSYBOX_VERSION)/busybox
 GEXCC_PREFIX ?= $(OUT)/gexcc
 
-.PHONY: help help-all help-tools gexc page page-sp assets mesa xwayland serve runtime \
+.PHONY: help help-all help-tools gexc assets mesa xwayland runtime \
         sysroot sysroot64 busybox gexcc gexcc-win wine wine-x64 native-libs steam-api \
-        eject-page eject-site test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
+        test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
         musl-src musl64-src llvm-src wine64-src
 
 help:
 	@echo 'make gexc          gexc for AArch64, x86-64 and i386 guests (target/release, target/x86/release)'
-	@echo 'make page          the page, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (page/dist)'
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
-	@echo 'make mesa          Mesa for the page alone'
-	@echo 'make test          the runtime tests: node test/run.mjs (ARGS="..." passes options)'
+	@echo 'make mesa          Mesa into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
+	@echo 'make test          the runtime tests: node test/run.mjs on the package make runtime builds (ARGS="..." passes options)'
 	@echo 'make help-all      every target'
 
 help-all: help
 	@echo
-	@echo 'make page-sp       the single-thread page (page/dist-sp)'
-	@echo 'make assets        the hosts, guest libraries and rootfs alone (page/public)'
-	@echo 'make xwayland      Xwayland for the page alone'
+	@echo 'make assets        the hosts, guest libraries and rootfs alone (runtime/files/out)'
+	@echo 'make xwayland      Xwayland into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
 	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
-	@echo 'make serve         serve page/dist (PORT, default 8088) and page/dist-sp (SP_PORT, 8089)'
 	@echo 'make runtime       the npm package @gexemu/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
 	@echo 'make sysroot64     the LP64 sysroot (musl at MUSL64_COMMIT)'
@@ -84,8 +80,6 @@ help-all: help
 	@echo 'make wine-x64      64-bit Wine without WoW64'
 	@echo 'make native-libs   zlib, zstd, SQLite as LP64 wasm replacements (ZLIB_SRC, ZSTD_SRC, SQLITE_SRC)'
 	@echo 'make steam-api     libsteam_api for games (STEAM_API_JSON; out/steam)'
-	@echo 'make eject-page    an ejected program'"'"'s page library (DIR=, default out/eject-page)'
-	@echo 'make eject-site    an ejected program'"'"'s static site (PROJECT=, SITE=)'
 	@echo 'make check         cargo test, the workspace (X86=1: with the x86 features)'
 	@echo 'make check-gl      the GL tables match their generators'
 	@echo 'make regen-gl      rewrite the GL tables from the Khronos registry'
@@ -103,11 +97,11 @@ gexc:
 	cargo build --release -p gexc --features x86 --target-dir target/x86
 	@echo $(GEXC_A64) $(GEXC_X86)
 
-# ---- the page ----
+# ---- the runtime's files (runtime/files/out) and its package ----
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
-# vite and the page's other npm packages, at package-lock.json's versions
-NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
+# vite and wisp-js, which runtime/build.sh builds the package with, at package-lock.json's versions
+NPM_CI = [ $(ROOT)/runtime/node_modules/.package-lock.json -nt $(ROOT)/runtime/package-lock.json ] || (cd $(ROOT)/runtime && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others. Their
 # programs are i386 Linux ones: a host that does not run those (any but x86
@@ -140,36 +134,22 @@ GEX_MESA_PAGE_ONLY ?= 1
 export GEX_MESA_PAGE_ONLY
 PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
 
-page: toolchains
-	@$(EMCC_CHECK)
-	$(MESA_CHECKOUT)
-	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp $(PAGE_FLAGS)
-	@echo $(ROOT)/page/dist
-page-sp: toolchains
-	@$(EMCC_CHECK)
-	$(MESA_CHECKOUT)
-	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --sp $(PAGE_FLAGS)
-	@echo $(ROOT)/page/dist-sp
 assets: toolchains
-	$(ROOT)/page/build-assets.sh
-	@echo $(ROOT)/page/public
+	$(ROOT)/runtime/files/build-assets.sh
+	@echo $(ROOT)/runtime/files/out
+# FLAVOUR: --mp (the multi-process build's), --sp or --both
+FLAVOUR ?= --mp
 mesa:
 	$(MESA_CHECKOUT)
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --gl-only
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --gl-only
 xwayland:
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --x-only
-PORT ?= 8088
-SP_PORT ?= 8089
-serve:
-	node $(ROOT)/page/serve.mjs $(PORT) --sp-port $(SP_PORT)
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --x-only
 PKG ?= $(OUT)/runtime
 runtime:
 	$(NPM_CI)
-	$(ROOT)/page/runtime/build.sh $(PKG)
+	$(ROOT)/runtime/build.sh $(PKG)
 	@echo $(PKG)
 
 # ---- pinned sources ----
@@ -251,20 +231,10 @@ steam-api:
 	sh $(ROOT)/guest/steam/build.sh $(OUT)/steam
 	@echo $(OUT)/steam
 
-# ---- ejected programs ----
-DIR ?= $(OUT)/eject-page
-eject-page:
-	$(ROOT)/site/build-eject-page.sh $(DIR)
-	@echo $(DIR)
-eject-site:
-	@[ -n "$(PROJECT)" ] && [ -n "$(SITE)" ] || { echo "make eject-site: set PROJECT (an ejected project) and SITE (the output directory)"; exit 1; }
-	node $(ROOT)/site/eject-site.mjs $(PROJECT) $(SITE) $(SITE_ARGS)
-	@echo $(SITE)
-
 # ---- tests and checks ----
-test:
+test: runtime
 	@[ -x $(GEXC_A64) ] || $(MAKE) gexc
-	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs $(ARGS)
+	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs --package $(PKG) $(ARGS)
 check:
 	cargo test --release --workspace --exclude gex-kmem --exclude gex-kernel-wasm --exclude gex-browser \
 	  $(if $(X86),--features gex-kernel/x86$(,)gex-xlate/x86$(,)gexc/x86$(,)gex-native/x86$(,)gex-eject/x86 --target-dir target/x86t)

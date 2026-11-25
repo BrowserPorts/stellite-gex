@@ -147,6 +147,13 @@ pub extern "C" fn k_futex_wake(addr: u64) {
     wait::notify(q);
 }
 
+/// TEST (`debugpanic=prctl`): let `prctl(PR_GEX_DEBUG_TRAP)` panic here, in
+/// the global kernel, where a process's prctl is answered.
+#[no_mangle]
+pub extern "C" fn k_arm_debug_trap() {
+    gex_kernel::proc::arm_debug_trap();
+}
+
 /// The generation of the futex at `addr`, sampled when a Worker parks on it and
 /// compared on every re-check.
 #[no_mangle]
@@ -2107,12 +2114,62 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     }
 }
 
+/// Send signal `signo` to every live process named the `len` bytes at `at`:
+/// the name it published (its info's first line) or its program's file name
+/// (the last `/`-part of its first argument). The number signalled, or a
+/// negative errno. A page asks a daemon it did not start by name this way
+/// (sys.signal), since it knows no pid.
+#[no_mangle]
+pub extern "C" fn k_kill_named(caller: i32, at: gex_kmem::PAddr, len: u32, signo: u32) -> i32 {
+    let len = len.min(256);
+    let mut name = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(name.as_mut_ptr(), at, len) };
+    }
+    if name.is_empty() {
+        return -22;
+    }
+    let mut n = 0;
+    for e in procs().entries() {
+        if e.zombie || !named(&e.info, &name) {
+            continue;
+        }
+        if signo != 0 {
+            note_kill(caller, e.pid, signo);
+        }
+        if let Ok(k) = procs().kill(caller, e.pid, signo) {
+            n += k as i32;
+        }
+    }
+    n
+}
+
+/// Whether a process's published info (`name\nargs`, NUL-separated) names
+/// `want`: as its name, or as its first argument's file name.
+fn named(info: &[u8], want: &[u8]) -> bool {
+    let nl = info.iter().position(|&b| b == b'\n').unwrap_or(info.len());
+    if &info[..nl] == want {
+        return true;
+    }
+    let args = info.get(nl + 1..).unwrap_or(&[]);
+    let argv0 = &args[..args.iter().position(|&b| b == 0).unwrap_or(args.len())];
+    let base = &argv0[argv0.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
+    base == want
+}
+
 /// The last signal this kernel handed to anyone: caller, target, number.
 ///
 /// "Killed by signal 1" says nothing about who decided that, and the senders
 /// are spread out -- the shared terminal's line discipline, a pty hangup, and
 /// any guest's own `kill`. The shim reads this for its death report.
 static LAST_KILL: Mutex<(i32, i32, u32)> = Mutex::new((0, 0, 0));
+
+/// The last kills, with their numbers ([`KILL_SEQ`]), for a report about
+/// one process ([`k_last_kill_to`]): [`LAST_KILL`] is anybody's, and a
+/// process that died of a kill named the one sent to another pid after it
+/// (wineserver ending a crashed program and then its conhost).
+const KILLS_KEPT: usize = 64;
+static KILLS: Mutex<std::collections::VecDeque<(i32, i32, u32, u32)>> = Mutex::new(std::collections::VecDeque::new());
 /// How many signals have been sent, so notes from different Workers can be put
 /// in order -- which is the whole question when one process's signal makes
 /// another one misbehave.
@@ -2121,7 +2178,12 @@ static KILL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 fn note_kill(caller: i32, target: i32, signo: u32) {
     if signo != 0 {
         *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner()) = (caller, target, signo);
-        KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let seq = KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release) + 1;
+        let mut k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+        if k.len() >= KILLS_KEPT {
+            k.pop_front();
+        }
+        k.push_back((caller, target, signo, seq));
     }
 }
 
@@ -2129,6 +2191,26 @@ fn note_kill(caller: i32, target: i32, signo: u32) {
 #[no_mangle]
 pub extern "C" fn k_last_kill_seq() -> u32 {
     KILL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The last kill that reached `pid` (of [`KILLS_KEPT`]): sent to it, to its
+/// process group `pgid`, or to everyone (`kill(-1)`); as [`k_last_kill`]
+/// packs one, 0 for none. Its number from [`k_last_kill_to_seq`].
+#[no_mangle]
+pub extern "C" fn k_last_kill_to(pid: i32, pgid: i32) -> u64 {
+    last_kill_to(pid, pgid).map_or(0, |(caller, target, signo, _)| {
+        ((caller as i64 as u64) << 40) | (((target as i64 as u64) & 0xffff_ffff) << 8) | (signo as u64 & 0xff)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn k_last_kill_to_seq(pid: i32, pgid: i32) -> u32 {
+    last_kill_to(pid, pgid).map_or(0, |k| k.3)
+}
+
+fn last_kill_to(pid: i32, pgid: i32) -> Option<(i32, i32, u32, u32)> {
+    let k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+    k.iter().rev().find(|&&(_, t, _, _)| t == pid || t == -1 || (pgid > 0 && t == -pgid)).copied()
 }
 
 /// Caller in the high bits, target in the middle, signal in the low byte. A
@@ -3444,6 +3526,18 @@ pub extern "C" fn k_fs_truncate(handle: i32, len: u64) -> i32 {
     as_unit(h.truncate(len))
 }
 
+/// `?systime=1`: count from now on (`on` 1), or read
+/// (`gex_kernel::vfs::tmpfs::ADVISE_STATS[i]`, `on` 2: laid-wait ns, laid waits, fadvise calls).
+#[no_mangle]
+pub extern "C" fn k_advise_stat(on: u32, i: u32) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if on == 1 {
+        gex_kernel::vfs::tmpfs::ADVISE_TIMED.store(true, Relaxed);
+        return 0;
+    }
+    gex_kernel::vfs::tmpfs::ADVISE_STATS.get(i as usize).map_or(0, |s| s.load(Relaxed))
+}
+
 /// `posix_fadvise` of an open file (`FileHandle::advise`): a lazy file fetches
 /// what is asked now, in the caller's Worker.
 #[no_mangle]
@@ -3494,7 +3588,7 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
 /// written into; an open or a stat alone does not count), one path a line, at
 /// `at`; their length, or `-ERANGE` with nothing written when `cap` will not
 /// hold them (ask again with more). A recorded run's read set: gex-eject's
-/// bundle split (page/src/fs-opened.js asks).
+/// bundle split (runtime/src/host/fs-opened.js asks).
 #[no_mangle]
 pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
     let mut b = rootfs().read_set().join("\n");
@@ -4093,7 +4187,9 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     }
     // Traced ([`k_fs_pending_trace`]): in 10 ms slices, each wait kept.
     let traced = PENDING_TRACE.load(core::sync::atomic::Ordering::Relaxed);
-    let (slice, per_sec) = if traced { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
+    // (`?systime=1`: timed in 10 ms slices too, into ADVISE_STATS)
+    let timed = gex_kernel::vfs::tmpfs::ADVISE_TIMED.load(core::sync::atomic::Ordering::Relaxed);
+    let (slice, per_sec) = if traced || timed { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
     let start = traced.then(|| (rootfs().pending_path(ino), FILLED.load(core::sync::atomic::Ordering::Relaxed)));
     let mut n = 0u32;
     while word.load(Acquire) == gex_kernel::vfs::tmpfs::PENDING {
@@ -4104,6 +4200,11 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
         if n == 30 * per_sec {
             PENDING_LONG.store(ino, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+    if timed && n > 0 {
+        let st = &gex_kernel::vfs::tmpfs::ADVISE_STATS;
+        st[0].fetch_add(n as u64 * 10_000_000, core::sync::atomic::Ordering::Relaxed);
+        st[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     if let Some((path, at)) = start {
         let path = path.unwrap_or_else(|| format!("inode {ino}"));

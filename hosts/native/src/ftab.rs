@@ -600,6 +600,25 @@ pub(crate) fn register_ffi(linker: &mut wasmtime::Linker<HostState>) -> Result<(
             Ok(slot as i64)
         })())
     })?;
+    // `gex.ffi_closure(addr, entry)`: guest address `addr` (a libffi
+    // closure's, where gexcc-win's libffi wrote a skeleton stub) enters the
+    // module's function `entry` (its one Win64 entry, which finds the
+    // closure by ctx::LAST_TARGET). 0, or -1 when `entry` is no kept
+    // module's. It stays bound (libffi pools its closures).
+    linker.func_wrap(gex_abi::IMPORT_MODULE, "ffi_closure", |caller: Caller<'_, HostState>, addr: i64, entry: i64| -> wasmtime::Result<i32> {
+        crate::host((|| -> anyhow::Result<i32> {
+            let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let sh = shared(&caller)?;
+            let (addr, entry) = (addr as u64, entry as u64);
+            let ok = u32::try_from(entry).is_ok_and(|i| sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.bind_index(addr, i));
+            if !ok {
+                return Ok(-1);
+            }
+            gex_kernel::ftab::fcache_clear(&mut GuestMem::new(memory.bytes()), addr);
+            publish_bridges(&sh, &[addr], &[])?;
+            Ok(0)
+        })())
+    })?;
     Ok(())
 }
 

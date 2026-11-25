@@ -28,7 +28,7 @@ pub use gex_emit::module::Metadata;
 /// to read `GEX_CHECK_SP` from. See `gex_emit::tier1::set_check_sp`.
 pub use gex_emit::tier1::set_check_sp;
 pub use gex_emit::tier1::set_copy_loop;
-pub use gex_emit::tier1::set_coherent_loads;
+pub use gex_emit::tier1::{set_coherent_loads, set_tear, set_tso2};
 pub use gex_emit::tier1::{add_trap_pc, set_guard_limit, set_trap_pc};
 pub use gex_emit::PageTable;
 pub use gex_emit::TranslatedModule;

@@ -595,6 +595,18 @@ fn forget(key: u64) {
     }
 }
 
+/// The most blocks a file holds: its block list is 4 bytes a block, so at
+/// most 64 MiB of the kernel's memory (with a page's 64 KiB blocks, a
+/// 1 TiB file).
+const MAX_BLOCKS: usize = 1 << 24;
+
+/// Block `b`'s place in a block list; one past any list when `b` does not
+/// fit a `usize` (the kernel is wasm32: a cast would wrap onto block
+/// `b mod 2^32`).
+fn slot(b: u64) -> usize {
+    usize::try_from(b).unwrap_or(usize::MAX)
+}
+
 /// A file's contents: its size and where each of its blocks is (0 a hole).
 #[derive(Debug)]
 pub struct PFile {
@@ -630,7 +642,7 @@ impl PFile {
             let from = (at % bs) as usize;
             let n = ((end - at) as usize).min(bs as usize - from);
             let o = (at - offset) as usize;
-            if self.map.get(b as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(b)).copied().unwrap_or(0) == 0 {
                 buf[o..o + n].fill(0);
             } else {
                 if direct && from == 0 {
@@ -665,7 +677,7 @@ impl PFile {
         let first = self.loc(b).off;
         let mut k = 0;
         while k < max {
-            if self.map.get((b + k) as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(b + k)).copied().unwrap_or(0) == 0 {
                 break;
             }
             let l = self.loc(b + k);
@@ -723,7 +735,7 @@ impl PFile {
         let mut n = 1;
         while n < self.ahead {
             let k = b + n;
-            if self.map.get(k as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(k)).copied().unwrap_or(0) == 0 {
                 break;
             }
             let l = self.loc(k);
@@ -748,8 +760,17 @@ impl PFile {
 
     /// Block `b` given a place, when it has none.
     fn alloc(&mut self, b: u64) -> Result<bool, Errno> {
-        if self.map.len() <= b as usize {
-            self.map.resize(b as usize + 1, 0);
+        // The block list is dense, so a block far past the end costs a list
+        // that long: past MAX_BLOCKS the file is too big (EFBIG, as a file
+        // past the file system's limit), and a list the kernel's memory
+        // cannot hold is ENOSPC. Never a panic: the offset is the program's.
+        let i = slot(b);
+        if i >= MAX_BLOCKS {
+            return Err(Errno::EFBIG);
+        }
+        if self.map.len() <= i {
+            self.map.try_reserve(i + 1 - self.map.len()).map_err(|_| Errno::ENOSPC)?;
+            self.map.resize(i + 1, 0);
         }
         if self.map[b as usize] != 0 {
             return Ok(false);
@@ -879,7 +900,7 @@ impl PFile {
     /// shares it, a place of its own, with the shared block's bytes unless
     /// the write is of all of it (`whole`).
     fn own(&mut self, b: u64, whole: bool) -> Result<(), Errno> {
-        let Some(&p) = self.map.get(b as usize) else { return Ok(()) };
+        let Some(&p) = self.map.get(slot(b)) else { return Ok(()) };
         if p == 0 || !is_shared(p - 1) {
             return Ok(());
         }
@@ -1163,6 +1184,35 @@ pub(crate) mod tests {
 
     /// Only a tmpfs that uses the store (the root) puts files there: one
     /// mounted beside it (`/dev/shm`, a program's own) keeps them in memory.
+    /// A write far past a file's end is EFBIG past the block list's limit,
+    /// never a panic (a wasm32 kernel's list of 2^29 blocks or more was a
+    /// capacity overflow), and below it lands where it was asked, not at
+    /// its offset wrapped to 32 bits.
+    #[test]
+    #[ignore]
+    fn a_write_far_past_the_end_is_efbig_or_lands_there() {
+        set_io(fake);
+        configure(4096, 64 * 4096, 0);
+        let fs = TmpFs::new();
+        fs.use_store();
+        let o = crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR;
+        let a = fs.open("far", o, 0o644).unwrap();
+        a.write_at(0, b"head").unwrap();
+        for off in [1u64 << 62, 1 << 41, (MAX_BLOCKS as u64) << 12] {
+            assert_eq!(a.write_at(off, &[7u8; 1286]).unwrap_err(), Errno::EFBIG, "at {off:#x}");
+        }
+        let off = (5u64 << 30) + 100;
+        assert_eq!(a.write_at(off, &[7u8; 1286]).unwrap(), 1286);
+        let mut got = [0u8; 1286];
+        assert_eq!(a.read_at(off, &mut got).unwrap(), 1286);
+        assert!(got.iter().all(|&x| x == 7));
+        let mut head = [0u8; 4];
+        a.read_at(0, &mut head).unwrap();
+        assert_eq!(&head, b"head");
+        fs.unlink("far").unwrap();
+        configure(0, 0, 0);
+    }
+
     #[test]
     #[ignore]
     fn only_the_root_uses_the_store() {

@@ -58,6 +58,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -94,10 +95,14 @@ std::string sigName(FunctionType *FT, const DataLayout &DL) {
   return s;
 }
 
+static bool structFP(Function &F, bool &ret, std::vector<bool> &ps);
+
 // The signature string of gexw.sig64: result, ':', parameters; v void,
 // i an integer of up to 32 bits, I a 64-bit integer, p a pointer, f float,
 // d double, X a 128-bit integer, bN a struct of N bytes by value, and a
-// leading sN for a struct of N bytes returned through the first parameter.
+// leading sN for a struct of N bytes returned through the first parameter;
+// F and D a struct of one float or one double, which wasm passes as the
+// scalar and Win64 as a 4- or 8-byte struct, in an integer slot (structFP).
 std::string sig64(Function &F, const DataLayout &DL) {
   FunctionType *FT = F.getFunctionType();
   auto t = [&](Type *T) -> std::string {
@@ -112,14 +117,19 @@ std::string sig64(Function &F, const DataLayout &DL) {
   };
   std::string s, ps;
   unsigned first = 0;
+  bool retInt;
+  std::vector<bool> intFP;
+  structFP(F, retInt, intFP);
+  auto fp = [](Type *T) { return T->isFloatTy() ? "F" : "D"; };
   if (FT->getNumParams() && F.hasParamAttribute(0, Attribute::StructRet)) {
     s = "s" + std::to_string(DL.getTypeAllocSize(F.getParamStructRetType(0)));
     first = 1;
   } else {
-    s = t(FT->getReturnType());
+    s = retInt ? fp(FT->getReturnType()) : t(FT->getReturnType());
   }
   for (unsigned i = first; i < FT->getNumParams(); i++) {
     if (Type *BT = F.getParamByValType(i)) ps += "b" + std::to_string(DL.getTypeAllocSize(BT));
+    else if (intFP[i]) ps += fp(FT->getParamType(i));
     else ps += t(FT->getParamType(i));
   }
   if (FT->isVarArg()) ps += ".";
@@ -127,6 +137,56 @@ std::string sig64(Function &F, const DataLayout &DL) {
 }
 
 static bool smallStruct(uint64_t n) { return n == 1 || n == 2 || n == 4 || n == 8; }
+
+// Which of F's float and double parameters (by IR index), and whether its
+// float or double result, were a struct of that one scalar in the source
+// (struct { double d; }): clang's wasm C ABI passes and returns such a struct
+// as the scalar, where Win64 passes and returns it in an integer register,
+// as any struct of 4 or 8 bytes. The IR has lost it; GexLLP64 (the clang
+// plugin of the same compile) noted it from the AST: its gexw_struct_fp.
+// False, all clear, when nothing says so (no plugin: rustc, or a compile
+// without it), or when the note does not fit F's IR (then F is treated as
+// before, its scalars as scalars).
+static bool structFP(Function &F, bool &ret, std::vector<bool> &ps) {
+  using Look = const char *(*)(const char *);
+  static Look look = (Look)sys::DynamicLibrary::SearchForAddressOfSymbol("gexw_struct_fp");
+  FunctionType *FT = F.getFunctionType();
+  ret = false;
+  ps.assign(FT->getNumParams(), false);
+  const char *m = look ? look(F.getName().str().c_str()) : nullptr;
+  if (!m || !*m) return false;
+  auto fail = [&] {
+    ret = false;
+    ps.assign(FT->getNumParams(), false);
+    return false;
+  };
+  bool sret = false;
+  const char *c = m + 1;
+  for (unsigned i = 0; i < FT->getNumParams(); i++) {
+    if (F.hasParamAttribute(i, Attribute::StructRet)) {
+      sret = true;
+      continue;
+    }
+    while (*c == 'e') c++;
+    if (!*c) return fail();
+    if (*c == 'R') {
+      Type *P = FT->getParamType(i);
+      if (!(P->isFloatTy() || P->isDoubleTy()) || F.getParamByValType(i)) return fail();
+      ps[i] = true;
+    }
+    c++;
+  }
+  while (*c == 'e') c++;
+  if (*c) return fail();
+  if (m[0] == 'R') {
+    Type *R = FT->getReturnType();
+    if (sret || !(R->isFloatTy() || R->isDoubleTy())) return fail();
+    ret = true;
+  }
+  bool any = ret;
+  for (bool b : ps) any |= b;
+  return any;
+}
 
 struct GexIcall : PassInfoMixin<GexIcall> {
   bool Wasm64 = false;
@@ -578,6 +638,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       args.push_back(SRet);
       first = 1;
     }
+    // (a struct of one float or double: Win64's integer slot, as its bits)
+    bool retInt;
+    std::vector<bool> intFP;
+    structFP(F, retInt, intFP);
     for (unsigned i = first; i < FT->getNumParams(); i++, k++) {
       Type *P = FT->getParamType(i);
       if (Type *BT = F.getParamByValType(i)) {
@@ -585,6 +649,8 @@ struct GexIcall : PassInfoMixin<GexIcall> {
           args.push_back(B.CreateIntToPtr(B.CreateCall(helper("__gexw_argptr", I64, {I32, I32}), {Ctx, B.getInt32(k)}), Ptr));
         else
           args.push_back(B.CreateIntToPtr(arg(k), Ptr));
+      } else if (intFP[i]) {
+        args.push_back(P->isDoubleTy() ? B.CreateBitCast(arg(k), F64) : B.CreateBitCast(B.CreateTrunc(arg(k), I32), F32));
       } else if (P->isPointerTy()) {
         args.push_back(B.CreateIntToPtr(arg(k), P));
       } else if (P->isDoubleTy()) {
@@ -609,6 +675,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (SRet && sretReg) Out = ret64(B.CreateLoad(I64, SRet));
     else if (SRet) Out = ret64(B.CreatePtrToInt(SRet, I64));
     else if (RT->isVoidTy()) Out = B.CreateCall(helper("__gexw_ret_void", I32, {I32, I64}), {Ctx, Ret});
+    else if (retInt) Out = ret64(RT->isDoubleTy() ? B.CreateBitCast(R, I64) : B.CreateZExt(B.CreateBitCast(R, I32), I64));
     else if (RT->isDoubleTy()) Out = B.CreateCall(helper("__gexw_ret_f64", I32, {I32, I64, F64}), {Ctx, Ret, R});
     else if (RT->isFloatTy()) Out = B.CreateCall(helper("__gexw_ret_f32", I32, {I32, I64, F32}), {Ctx, Ret, R});
     else if (RT->isPointerTy()) Out = ret64(B.CreatePtrToInt(R, I64));
@@ -676,7 +743,9 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   // whose facts are not 0, a record { function, facts } in `gexw_facts`. gex
   // finds a guest call's adapter by the callee's slot (FuncMap::get).
 
-  static constexpr uint32_t FACT_SRET_SMALL = 1, FACT_SRET_BIG = 2, FACT_REFUSED = 1u << 31;
+  // (and on a float or double parameter, the byval bit 1 << (2 + i) says a
+  // struct of that one scalar, in its integer slot: see structFP)
+  static constexpr uint32_t FACT_SRET_SMALL = 1, FACT_SRET_BIG = 2, FACT_RET_INT = 1u << 30, FACT_REFUSED = 1u << 31;
   static constexpr unsigned CTX_LAST_TARGET = 352;  // gex_abi ctx::LAST_TARGET
 
   // (the default; GEXW_ENTRY=thunks keeps the thunk per function)
@@ -741,6 +810,19 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (!RT || RT->isIntegerTy(128)) {
       facts = FACT_REFUSED;
       return false;
+    }
+    bool retInt;
+    std::vector<bool> intFP;
+    if (structFP(F, retInt, intFP)) {
+      for (unsigned i = 0; i < intFP.size(); i++) {
+        if (!intFP[i]) continue;
+        if (i >= 28) {
+          facts = FACT_REFUSED;
+          return false;
+        }
+        facts |= 1u << (2 + i);
+      }
+      if (retInt) facts |= FACT_RET_INT;
     }
     CT = FunctionType::get(RT, ps, false);
     return true;
@@ -814,7 +896,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     }
     for (unsigned i = first; i < CT->getNumParams(); i++, k++) {
       Type *P = CT->getParamType(i);
-      if (facts & (1u << (2 + i))) args.push_back(B.CreateCall(helper("__gexw_argptr", I64, {I32, I32}), {Ctx, B.getInt32(k)}));
+      bool bit = facts & (1u << (2 + i));
+      if (bit && P->isDoubleTy()) args.push_back(B.CreateBitCast(arg(k), F64));
+      else if (bit && P->isFloatTy()) args.push_back(B.CreateBitCast(B.CreateTrunc(arg(k), I32), F32));
+      else if (bit) args.push_back(B.CreateCall(helper("__gexw_argptr", I64, {I32, I32}), {Ctx, B.getInt32(k)}));
       else if (P->isIntegerTy(64)) args.push_back(arg(k));
       else if (P->isIntegerTy(32)) args.push_back(B.CreateTrunc(arg(k), I32));
       else if (P->isIntegerTy(128)) args.push_back(B.CreateLoad(P, B.CreateIntToPtr(arg(k), Ptr)));
@@ -828,6 +913,8 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (facts & FACT_SRET_SMALL) Out = ret64(B.CreateLoad(I64, SRet));
     else if (facts & FACT_SRET_BIG) Out = ret64(SRet);
     else if (RT->isVoidTy()) Out = B.CreateCall(helper("__gexw_ret_void", I32, {I32, I64}), {Ctx, Ret});
+    else if (facts & FACT_RET_INT)
+      Out = ret64(RT->isDoubleTy() ? B.CreateBitCast(R, I64) : B.CreateZExt(B.CreateBitCast(R, I32), I64));
     else if (RT->isDoubleTy()) Out = B.CreateCall(helper("__gexw_ret_f64", I32, {I32, I64, F64}), {Ctx, Ret, R});
     else if (RT->isFloatTy()) Out = B.CreateCall(helper("__gexw_ret_f32", I32, {I32, I64, F32}), {Ctx, Ret, R});
     else Out = ret64(RT->isIntegerTy(64) ? R : B.CreateZExt(R, I64));

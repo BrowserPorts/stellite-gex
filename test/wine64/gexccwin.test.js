@@ -38,6 +38,10 @@
 //   -include, then gexcc-win's prelude;
 // - wkdata: weak undefined data links and its address is null; weak data
 //   a DLL defines (wkdll) reads the DLL's;
+// - wkfunc: weak undefined functions are null, not stubs (C's weak
+//   declaration, C++'s thread_local init function, a DLL's weak reference);
+//   a strong reference to the same name in another module still fails to
+//   link, and a stubbed strong one is never null, natively or on the page;
 // - fficall: libffi (-lffi): ffi_call to a DLL's functions as native values
 //   and as GetProcAddress's guest ones, mixed scalars and structs by value,
 //   a variadic call; closures refused (FFI_BAD_ABI);
@@ -48,6 +52,15 @@
 //   relocations applies within the engines' function size limit (pelink
 //   splits it);
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
+// - shmview-same, -whole, -shifted: two views of one section in one
+//   process (Firefox's Shmem with e10s off) are one range, records handed
+//   through them under section churn read back as written, and ended
+//   threads' TLS chunks no longer show as Wine's memory; shmview-based: a
+//   view at an address asked for, a separate copy (expected); shmview-rdonly:
+//   a read-only first view and a read-write second, one range, written
+//   through the second (it reports read-write: one range, one protection,
+//   an expected gap); shmview-big: a page viewed at the start of a 256 MiB
+//   section and one at 200 MiB, one range;
 // - owndll: a program linked against its own DLL's import library, the
 //   DLL's exports its default-visibility symbols: calls, a struct by value,
 //   the DLL's int and struct written and read on both sides;

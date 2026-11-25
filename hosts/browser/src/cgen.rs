@@ -1986,7 +1986,8 @@ fn builtin_data(file: &str, wasm: &[u8]) -> Result<u32, String> {
 /// `gex.host_data(from, out, max)`: the memory gex mapped for native
 /// modules (their data, heaps, stacks) from the `from`th on, as (start, end)
 /// u32 pairs at `out`, at most `max`; how many there are in all. Wine's
-/// ntdll makes a view of each (`MemoryMap::note_host_data`).
+/// ntdll makes a view of each, and drops it at a range listed again the
+/// other way round, `(end, start)`: unmapped since (`MemoryMap::host_data`).
 #[no_mangle]
 pub extern "C" fn gex_host_data(from: u32, out: u32, max: u32) -> u32 {
     let ranges = crate::sigs::proc_home().mm().lock().host_data().to_vec();

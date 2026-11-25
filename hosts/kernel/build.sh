@@ -31,8 +31,8 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     TDIR=target/shared-kernel-x86
 fi
 # What this is built from, taken now, before the build: written beside it as
-# page/public/gex/.inputs once it is installed (page/build-inputs.mjs).
-INPUTS_KEY=$(node page/build-inputs.mjs key gex_kernel$INFIX)
+# runtime/files/out/gex/.inputs once it is installed (runtime/files/build-inputs.mjs).
+INPUTS_KEY=$(node runtime/files/build-inputs.mjs key gex_kernel$INFIX)
 OUT=$TDIR/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 # A shared memory carries its maximum in its *type*, so the host's memory and
 # this module must agree on it exactly. The linker defaults the maximum to the
@@ -97,19 +97,15 @@ RUSTFLAGS="$REMAP -C link-arg=--import-memory \
 # for both: the empty one has no pages.
 P64=$(((16 << 30) / 65536))
 ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT" "$OUT.p32" env process 0 1
-node hosts/kernel/add-memory.mjs "$OUT.p32" page/public/gex/gex_kernel$INFIX.wasm env process64 0 1 $P64 64
+node hosts/kernel/add-memory.mjs "$OUT.p32" runtime/files/out/gex/gex_kernel$INFIX.wasm env process64 0 1 $P64 64
 ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT" "$OUT.p32" env process 0 0
-node hosts/kernel/add-memory.mjs "$OUT.p32" page/public/gex/gex_kernel$INFIX.plain.wasm env process64 0 0 $P64 64
+node hosts/kernel/add-memory.mjs "$OUT.p32" runtime/files/out/gex/gex_kernel$INFIX.plain.wasm env process64 0 0 $P64 64
 rm -f "$OUT.p32"
 
 # The `.m64` name a 64-bit memory's page loads (runtime.js, run-node.mjs):
 # the same module, since it serves both flavours.
 if [ -n "$ARCH_FEATURES" ]; then
-    cp page/public/gex/gex_kernel$INFIX.wasm page/public/gex/gex_kernel$INFIX.m64.wasm
+    cp runtime/files/out/gex/gex_kernel$INFIX.wasm runtime/files/out/gex/gex_kernel$INFIX.m64.wasm
 fi
 
-node page/build-inputs.mjs stamp page/public/gex "gex_kernel$INFIX=$INPUTS_KEY"
-
-# And the site, which is a copy of public/ and will otherwise keep serving
-# the module that was here a moment ago.
-page/refresh-dist.sh
+node runtime/files/build-inputs.mjs stamp runtime/files/out/gex "gex_kernel$INFIX=$INPUTS_KEY"

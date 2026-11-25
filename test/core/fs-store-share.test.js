@@ -7,8 +7,8 @@
 //   2. after a reload both copies read back with their own writes; a write
 //      to one leaves the other as it was; that other removed;
 //   3. after a reload the last copy is whole.
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 600 };
 

@@ -3500,7 +3500,7 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_surface_canvas(uint32_t uid, uint32_t on) {
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_produced() { return produced; }
 /* The frames a client's D3D windows have presented that the page has not
  * shown yet: what the page paces that client's presents by
- * (page/src/d3d-pacing.js). Its windows are in the globals while it is the
+ * (runtime/src/host/d3d-pacing.js). Its windows are in the globals while it is the
  * current client, in its saved state otherwise. */
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_client_unshown(uint32_t client) {
     const std::map<uint32_t, gex_surface>* table = &surfaces;

@@ -36,6 +36,10 @@ export { ROOT };
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'wow64');
 /** The loader, in the install. */
 export const LOADER = 'lib/wine/x86_64-unix/wine';
+/** The Windows user a prefix's profile is made for: wine/dist.sh makes the
+ *  prefix as USER=gex, and wine/page-prefix.sh keeps that profile (PAGE_USER,
+ *  default gex). */
+export const PREFIX_USER = 'gex';
 // A run's lines saying why a process died: the runtime's, and Wine's fatal ones.
 const DEATH = /^\[gex\] pid \d+ killed by|^\[gex\] pid \d+: a vfork child|gex: (process|thread) \S+ failed|panicked at|RuntimeError|RangeError/;
 const WINE_FATAL = /^wine: |wineserver: |:err:(process|module|virtual|server|sync):/;
@@ -393,7 +397,10 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
         }
         flags = [...flags, '--wayland', sock, '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
       }
-      const we = { WINEPREFIX: p, ...WENV, ...wineEnv };
+      // As the user the prefix's profile is made for (PREFIX_USER): Wine names
+      // the profile after $USER, and the host's user has none in the prefix
+      // (no Desktop: a .lnk's ShellExecute fails).
+      const we = { WINEPREFIX: p, USER: PREFIX_USER, LOGNAME: PREFIX_USER, ...WENV, ...wineEnv };
       const argv = [gexc, 'run', ...flags, ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]), loader, ...args.map(String)];
       // Not the host's display: gexc --wayland sets WAYLAND_DISPLAY and
       // XDG_RUNTIME_DIR to its own compositor only when they are not given.

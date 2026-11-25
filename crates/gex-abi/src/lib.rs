@@ -694,6 +694,12 @@ pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 /// low region, never guest-observable.
 pub const SPLIT_LOCK: u64 = RESERVED_END - 128;
 
+/// The tear debug switch's counters (`?tear=`, gex-emit `set_tear`): plain
+/// misaligned 8-byte loads at [`TEAR_COUNTS`], stores at `TEAR_COUNTS + 8`
+/// (`u64`s, atomic adds). Per process, in the reserved low region, never
+/// guest-observable; nothing touches them with the switch off.
+pub const TEAR_COUNTS: u64 = RESERVED_END - 112;
+
 /// One bit per dispatch-directory page (bit `page & 7` of byte `page >> 3`),
 /// set by the host once a page's code changed after a function-tier unit was
 /// installed over it (Detours patching a prologue, a JIT rewriting code).
@@ -1157,6 +1163,11 @@ pub mod cache_op {
     /// aligned 8-byte words, at the address given, which runs under
     /// [`super::SPLIT_LOCK`] -- atomic against other such accesses only.
     pub const SPLIT_LOCK: i32 = 10;
+    /// Not a cache operation: one of the first plain misaligned 8-byte
+    /// loads (`TEAR_STORE`: stores) the tear debug switch counts
+    /// ([`super::TEAR_COUNTS`]), at the address given.
+    pub const TEAR_LOAD: i32 = 16;
+    pub const TEAR_STORE: i32 = 17;
     /// Not a cache operation: a locked access below [`super::GUEST_FLOOR`],
     /// in the runtime's own memory, at the address given. The host raises
     /// an access violation (NT) or SIGSEGV (Linux) and does not return.

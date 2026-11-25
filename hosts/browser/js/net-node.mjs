@@ -66,7 +66,7 @@ export class NodeNetwork {
     this.#tcp = tcp;
   }
   /** Called on every socket event: the single-thread build wakes its parked
-   *  fibers with it (as page/src/net.js's Sockets does). */
+   *  fibers with it (as runtime/src/host/net.js's Sockets does). */
   onActivity = () => {};
 
   /** A fresh identifier; the guest connects it next. */
@@ -200,7 +200,7 @@ export class NodeNetwork {
     return n;
   }
 
-  /** `recv`, leaving the bytes queued (page/src/net.js's `peek`). */
+  /** `recv`, leaving the bytes queued (runtime/src/host/net.js's `peek`). */
   peek(id, out) {
     const s = this.#sockets.get(id);
     if (!s) return 0;
@@ -227,7 +227,7 @@ export class NodeNetwork {
     return n > 0 ? n : s.eof || s.status === REFUSED ? -1 : 0;
   }
 
-  /** Another holder (page/src/net.js's `dup`): the last `close` ends it. */
+  /** Another holder (runtime/src/host/net.js's `dup`): the last `close` ends it. */
   dup(id) {
     const s = this.#sockets.get(id);
     if (!s) return 0;

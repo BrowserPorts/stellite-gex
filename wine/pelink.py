@@ -60,7 +60,20 @@ STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-impor
 SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
 OTHER_NATIVE = {}  # function or data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
-WEAK_UNDEF = set()  # their objects' weak undefined names
+# their objects' weak undefined names, by module: data (WEAK_UNDEF) and
+# functions (WEAK_UNDEF_FUNCS: no stub, their address 0), and the names they
+# reference strongly (STRONG_UNDEF), which another module's weak reference
+# does not excuse
+WEAK_UNDEF = {}
+WEAK_UNDEF_FUNCS = {}
+STRONG_UNDEF = {}
+
+
+def weak_of(table, mods):
+    """The names weak in `table` for modules `mods` (one linked module):
+    weak in one of them and referenced strongly by none."""
+    weak = set().union(*(table.get(m, set()) for m in mods))
+    return weak - set().union(*(STRONG_UNDEF.get(m, set()) for m in mods))
 
 
 def cc(*args):
@@ -419,11 +432,13 @@ def main():
         del sys.argv[1]
     EXTRA.update(e[0] for e in extra)
     # (their weak undefined names, which may stay undefined)
-    for _, ro, _, _ in extra:
+    for mod, ro, _, _ in extra:
         # (wasm-objdump's linking section: llvm-objdump refuses a wasm64 -r
         # output, "invalid function symbol index")
         sym = subprocess.run(['wasm-objdump', '-x', '-j', 'linking', ro], capture_output=True, text=True).stdout
-        WEAK_UNDEF.update(re.findall(r'- \d+: D <([^>]+)> \[ undefined binding=weak', sym))
+        WEAK_UNDEF[mod] = set(re.findall(r'- \d+: D <([^>]+)> \[ undefined binding=weak', sym))
+        WEAK_UNDEF_FUNCS[mod] = set(re.findall(r'- \d+: F <([^>]+)> func=\d+ \[ undefined binding=weak', sym))
+        STRONG_UNDEF[mod] = set(re.findall(r'- \d+: [DF] <([^>]+)> (?:func=\d+ )?\[ undefined binding=global', sym))
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -997,11 +1012,12 @@ def stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp
         if not g or not mods or not all(m in EXTRA for m in mods):
             continue
         undef = syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only')
+        weak = weak_of(WEAK_UNDEF_FUNCS, mods)
         gaps = {}
         for m in mods:
             for (n, k), sig in sigs.get(m, {}).items():
                 if (k == 'undefined' and n in undef and '!' not in n and n not in elsewhere and n not in rt
-                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS
+                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS and n not in weak
                         and n not in CROSS_MODE and not n.startswith(('__gexw_', 'gexw_', '__wasm'))):
                     gaps.setdefault(n, sig)
         if not gaps:
@@ -2076,7 +2092,8 @@ static void *gexw_ntdll_proc(const char *name)
         if own and all(m in EXTRA for m in own):
             # (a weak one, `extern int x __attribute__((weak))` tested by
             # &x, may: it binds to 0)
-            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n and n not in WEAK_UNDEF)
+            weak = weak_of(WEAK_UNDEF, own)
+            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n and n not in weak)
             if lost:
                 for n in lost:
                     print(f'pelink: error: {out}: undefined data reference to `{n}\'', file=sys.stderr)
@@ -2190,13 +2207,41 @@ def check_imports(core, splits):
                     k += 1
                     _, k = leb_at(body, k)
         return names
+    def weak_imports(path):
+        # (dylink.0's import info: the module's own weak imports, as the
+        # loaders read them; a name another module references weakly does
+        # not excuse this one's strong import)
+        names = set()
+        for body in section(path, 0):
+            nl, k = leb_at(body, 0)
+            if body[k:k + nl] != b'dylink.0':
+                continue
+            k += nl
+            while k < len(body):
+                sub = body[k]
+                size, k = leb_at(body, k + 1)
+                end = k + size
+                if sub == 4:
+                    cnt, j = leb_at(body, k)
+                    for _ in range(cnt):
+                        ml, j = leb_at(body, j)
+                        j += ml
+                        fl, j = leb_at(body, j)
+                        field = body[j:j + fl].decode()
+                        j += fl
+                        flags, j = leb_at(body, j)
+                        if flags & 1:
+                            names.add(field)
+                k = end
+        return names
     mods = [core] + splits
     have = {m: exports(m) for m in mods}
     bad = []
     for m in mods:
         others = set().union(*(have[o] for o in mods if o != m))
+        weak = weak_imports(m)
         gaps = sorted({n for n in func_imports(m) if n not in others and n not in LOADER_IMPORTS
-                       and n not in WEAK_IMPORTS and n not in CROSS_MODE
+                       and n not in WEAK_IMPORTS and n not in weak and n not in CROSS_MODE
                        and n.split('!')[0] not in OTHER_NATIVE.values()})
         if gaps:
             bad.append(f'{os.path.basename(m)}: {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))

@@ -7,9 +7,9 @@
 # whatever its distribution installed, and nothing on a host that is not
 # Linux.
 #
-# The packages live in GEX_PACKAGE_CACHE when it is set (page/build.sh keeps
-# its caller's store there while its own CACHE is its work folder), else in
-# CACHE. Some hold paths that differ only in case (linux-libc-dev's
+# The packages live in GEX_PACKAGE_CACHE when it is set
+# (runtime/files/build.sh keeps its caller's store there while its own CACHE
+# is its work folder), else in CACHE. Some hold paths that differ only in case (linux-libc-dev's
 # netfilter headers: xt_CONNMARK.h, a target, beside xt_connmark.h, a match).
 # Both of each such set are left out, on every file system, so the store and
 # whatever copies from it (the sysroots' headers) can be case-insensitive and

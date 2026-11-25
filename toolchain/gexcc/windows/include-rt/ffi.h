@@ -8,8 +8,9 @@
  * gives, a Wine export's skeleton) is called as Win64 calls it, through
  * gexrt's __gexw_guest_call64.
  *
- * Closures are not made yet: ffi_closure_alloc gives a block and
- * ffi_prep_closure_loc refuses it with FFI_BAD_ABI. */
+ * A closure's function value is the closure's own address (the code
+ * ffi_closure_alloc gives), a guest address gex binds to libffi's closure
+ * entry; ffi_prep_closure_loc takes no other codeloc (FFI_BAD_ABI). */
 #ifndef GEXW_FFI_H
 #define GEXW_FFI_H
 

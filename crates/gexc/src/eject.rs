@@ -10,11 +10,12 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (crates/gex-eject/README.md)
-  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/page [--unit-cache DIR]... [--features -compositor,...] [--build]
-                                   the same for a Wine page (wine32, or wine64)
-                                   recorded by site/record-wine32.mjs: its
-                                   bundle, units and runtime, and the features
-                                   the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
+  gexc eject <wine32-record-dir> --out <project> [--unit-cache DIR]... [--features -compositor,...] [--build]
+                                   the same for a recorded Wine page (wine32,
+                                   or wine64): its bundle and units, and the
+                                   features a page keeps; the build writes
+                                   data a page runs on @gexemu/runtime
+                                   (crates/gex-eject/README.md, \"32-bit Wine pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
   gexc eject prepare <user/eject.json> <bundle.tar> <out.tar> [--prefix /pfx]
@@ -180,7 +181,6 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let mut out = None;
             let mut then_build = false;
             let mut web_shim = None;
-            let mut web_src = None;
             let mut unit_cache: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
                 .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
                 .unwrap_or_default();
@@ -196,10 +196,6 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     "--web-shim" => {
                         i += 1;
                         web_shim = Some(PathBuf::from(args.get(i).context("--web-shim needs gex_browser.wasm")?));
-                    }
-                    "--web-src" => {
-                        i += 1;
-                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's page/ directory")?));
                     }
                     "--unit-cache" => {
                         i += 1;
@@ -227,12 +223,11 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let out = out.context("gexc eject: where to? (--out <project>)")?;
             let runtime = std::env::current_exe().context("finding this gexc to copy into the project")?;
             if gex_eject::wine32::is_recording(&record) {
-                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/page (the page's source and the built runtime)")?;
                 let s = gex_eject::wine32::eject(
                     &record,
                     &out,
                     &runtime,
-                    &gex_eject::wine32::Wine32Options { web_src, unit_cache, features_off },
+                    &gex_eject::wine32::Wine32Options { unit_cache, features_off },
                 )?;
                 eprintln!(
                     "{}: a Wine page: {} processes, {} units and {} provider modules ({} MiB), bundle {} MiB, {} wasm modules{}",
@@ -254,8 +249,8 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 }
                 return Ok(None);
             }
-            if web_src.is_some() || !features_off.is_empty() {
-                bail!("--web-src and --features are for a wine32 recording (wine32-session.json)");
+            if !features_off.is_empty() {
+                bail!("--features is for a wine32 recording (wine32-session.json)");
             }
             let s = gex_eject::eject::eject(
                 &record,
@@ -277,7 +272,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 if s.kept_user { "; user/ kept" } else { "" }
             );
             if !s.web {
-                eprintln!("  no web build: give --web-shim <gex_browser.wasm> for run.mjs and index.html");
+                eprintln!("  no web build: give --web-shim <gex_browser.wasm> for run.mjs");
             }
             eprintln!(
                 "  the project holds the program's own code and the files it read; \
@@ -296,9 +291,8 @@ fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
     if let Some(w) = &r.wine32 {
         eprintln!(
-            "{}: Wine page built: {} page files, {} units; features off: {}",
+            "{}: Wine page built: {} units; features off: {}",
             dir.display(),
-            w.page_files,
             w.units,
             if w.features_off.is_empty() { "none".to_string() } else { w.features_off.join(", ") }
         );

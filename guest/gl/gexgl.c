@@ -4129,7 +4129,6 @@ static uint64_t gexgen_call(uint32_t opcode, const char *plan, const uint64_t *v
 static int egl_ready;
 static GEXGL_TLS void *egl_current_display;
 static GEXGL_TLS void *egl_current_context;
-static GEXGL_TLS void *egl_current_draw;
 static GEXGL_TLS void *egl_current_read;
 /* The window surfaces this process has, and which one is current.
  *

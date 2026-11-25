@@ -2028,6 +2028,7 @@ fn perform_block(
             val,
             deadline,
             parked,
+            ..
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
@@ -3747,7 +3748,12 @@ fn mount_filesystems(
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
-    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+    // Over the host's root, the host's directories there stay the host's
+    // (a ramdisk work tree: `gex_kernel::vfs::mount_dev_shm`).
+    match opts.sysroot {
+        None => gex_kernel::vfs::mount_dev_shm(&mut kernel.vfs, "/dev/shm", std::path::Path::new("/dev/shm")),
+        Some(_) => kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new())),
+    }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(

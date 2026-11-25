@@ -125,7 +125,7 @@ pub struct Config {
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
     /// default for a config without the setting. `"instrument"` builds
     /// units that report the functions a run calls, for a recording of the
-    /// site to take its coverage from (site/record-wine32.mjs). Each unit keeps the
+    /// site to take its coverage from (a recorder). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (crates/gex-eject/README.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the
@@ -168,15 +168,15 @@ pub struct Config {
     /// (crates/gex-eject/README.md, "Wineboot"); `"run"`, the default for a
     /// config without the setting, runs it as Wine does.
     pub wineboot_skip: bool,
-    /// The web build's start defaults (`"start"`): what the app library's
-    /// `start()` uses when the page passes no such option. Only options
+    /// The web build's start defaults (`"start"`): what its page uses
+    /// when it is given no such option. Only options
     /// that change nothing in the build's output belong here (crates/gex-eject/README.md,
     /// "The web build"); each is checked by name.
     /// As written (a JSON object's text), "{}" when absent.
     pub start: String,
 }
 
-/// `"start"`'s settings: app.js `start()` options a build may default.
+/// `"start"`'s settings: the launch options a build may default for its page.
 pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "filesystem", "ready"];
 
 impl Default for Config {
