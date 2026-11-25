@@ -56,7 +56,7 @@ say() { printf '\n== %s\n' "$*"; }
 # -- 1. shared by both: shim, kernel, seeds, providers, rootfs ----------------
 if [ "$ASSETS" = 1 ]; then
     say "runtime and assets"
-    "$HERE/build-assets.sh"
+    GEX_NO_REFRESH_DIST=1 "$HERE/build-assets.sh"
 fi
 
 # -- 2. Mesa and Xwayland, per flavour ----------------------------------------
@@ -128,4 +128,7 @@ xwl() { # xwl <mt|st>
 [ "$SP" = 1 ] && [ "$GL" = 1 ] && mesa st
 [ "$MP" = 1 ] && [ "$X" = 1 ] && xwl mt
 [ "$SP" = 1 ] && [ "$X" = 1 ] && xwl st
+# gex's pages (runtime/app/dist*), copies of runtime/files/out, made again
+# from what is here now; make page builds its own after this.
+"$ROOT/runtime/app/refresh-dist.sh"
 exit 0

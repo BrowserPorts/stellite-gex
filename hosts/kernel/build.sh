@@ -109,3 +109,7 @@ if [ -n "$ARCH_FEATURES" ]; then
 fi
 
 node runtime/files/build-inputs.mjs stamp runtime/files/out/gex "gex_kernel$INFIX=$INPUTS_KEY"
+
+# And gex's pages, a copy of runtime/files/out that would otherwise keep
+# serving the module that was here a moment ago.
+runtime/app/refresh-dist.sh

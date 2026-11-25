@@ -264,3 +264,7 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
 fi
 
 node runtime/files/build-inputs.mjs stamp runtime/files/out/gex "gex_browser$INFIX=$INPUTS_KEY"
+
+# And gex's pages, a copy of runtime/files/out that would otherwise keep
+# serving the shim that was here a moment ago.
+runtime/app/refresh-dist.sh

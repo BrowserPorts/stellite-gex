@@ -2,6 +2,8 @@ target/
 /out/
 *.gexm
 runtime/node_modules/
+runtime/app/dist/
+runtime/app/dist-sp/
 runtime/files/out/gex/
 runtime/files/out/rootfs/
 /runtime/files/out/fs/

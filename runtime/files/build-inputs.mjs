@@ -1,20 +1,20 @@
 // Which source a build was made from, and whether that is still the source.
 //
-// runtime/files/out/gex is not rebuilt when the source changes, and an
-// old build does not fail: it runs the old code, and a test reports what the
-// old code does. So each build writes a stamp, `.inputs`, beside what it
-// built: one line per artefact, `NAME KEY`, where KEY hashes the content of the
-// artefact's inputs (each file's git blob hash as the working tree has it, so
-// a commit of what was built keeps the key). Content, not times: a tree
-// copied after its build (cp -al, cp --parents) has new mtimes and the same
-// key.
+// runtime/app/dist and runtime/files/out/gex are not rebuilt when the
+// source changes, and an old build does not fail: it runs the old code, and
+// a test reports what the old code does. So each build writes a stamp,
+// `.inputs`, beside what it built: one line per artefact, `NAME KEY`, where
+// KEY hashes the content of the artefact's inputs (each file's git blob
+// hash as the working tree has it, so a commit of what was built keeps the
+// key). Content, not times: a tree copied after its build (cp -al, cp
+// --parents) has new mtimes and the same key.
 //
 //   node runtime/files/build-inputs.mjs key NAME            the key of NAME's inputs now
 //   node runtime/files/build-inputs.mjs stamp DIR NAME[=KEY]...
 //                                    (re)write NAME's line in DIR/.inputs: KEY,
 //                                    taken before the build, or the key now
 //
-// NAME is an artefact (gex_kernel, gex_browser), with the arch after a
+// NAME is an artefact (gex_kernel, gex_browser, page), with the arch after a
 // dot for another arch's build (gex_kernel.x86), which has the same inputs.
 //
 // The harness (gexdev/web/test/harness.mjs) and the test runner (test/run.mjs) call
@@ -27,11 +27,14 @@ import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..', '..');
 
-// What each artefact is built from: the kernel and the shim, both wasm.
+// What each artefact is built from. The pages' JavaScript (`page`,
+// runtime/app/build.sh's dists) is bundled by vite; the kernel and the shim
+// are wasm.
 const RUST = ['crates', 'Cargo.toml', 'Cargo.lock'];
 const INPUTS = {
   gex_kernel: ['hosts/kernel', ...RUST],
   gex_browser: ['hosts/browser', ':(exclude)hosts/browser/js', ...RUST],
+  page: ['runtime/src', 'runtime/app', 'runtime/package-lock.json', 'hosts/browser/js'],
 };
 // Not build inputs anywhere: documentation and tests.
 const SKIP = [':(exclude,glob)**/*.md', ':(exclude,glob)**/tests/**', ':(exclude,glob)**/test/**'];

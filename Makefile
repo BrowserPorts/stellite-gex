@@ -3,7 +3,7 @@
 # prints the path it made on its last line.
 #
 # Settings (command line or environment):
-#   OUT      outputs of the targets below that are not in target/ or page/
+#   OUT      outputs of the targets below that are not in target/ or runtime/
 #            (default: out/ in this tree, gitignored)
 #   CACHE    fetched sources and their bare mirrors (default ~/.cache/gex)
 #   JOBS     parallel jobs for the long builds (default 16)
@@ -16,6 +16,8 @@
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 #   WINE32_CACHE  32-bit Wine's sysroot, libraries and build tree (default CACHE/wine32)
 #   FLAVOUR  make mesa's and make xwayland's build: --mp (default), --sp or --both
+#   PAGE_FLAGS more flags for make page / page-sp: runtime/files/build.sh's
+#            (--no-assets after make assets), and --debug for runtime/app/build.sh
 #   GEX_TOOLCHAIN, GEX_X86_TOOLCHAIN  musl cross toolchains to use instead of the
 #            pinned ones make toolchains fetches
 
@@ -54,13 +56,14 @@ SYSROOT64 := $(OUT)/sysroot64-$(call short,$(MUSL64_COMMIT))
 BUSYBOX := $(OUT)/busybox/busybox-$(BUSYBOX_VERSION)/busybox
 GEXCC_PREFIX ?= $(OUT)/gexcc
 
-.PHONY: help help-all help-tools gexc assets mesa xwayland runtime \
+.PHONY: help help-all help-tools gexc page page-sp assets mesa xwayland serve runtime \
         sysroot sysroot64 busybox gexcc gexcc-win wine wine-x64 native-libs steam-api \
         test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
         musl-src musl64-src llvm-src wine64-src
 
 help:
 	@echo 'make gexc          gexc for AArch64, x86-64 and i386 guests (target/release, target/x86/release)'
+	@echo 'make page          gex'"'"'s pages, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (runtime/app/dist)'
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
 	@echo 'make mesa          Mesa into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
@@ -69,9 +72,11 @@ help:
 
 help-all: help
 	@echo
+	@echo 'make page-sp       the single-thread pages (runtime/app/dist-sp)'
 	@echo 'make assets        the hosts, guest libraries and rootfs alone (runtime/files/out)'
 	@echo 'make xwayland      Xwayland into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
 	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
+	@echo 'make serve         serve runtime/app/dist (PORT, default 8088) and runtime/app/dist-sp (SP_PORT, 8089)'
 	@echo 'make runtime       the npm package @gexemu/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
 	@echo 'make sysroot64     the LP64 sysroot (musl at MUSL64_COMMIT)'
@@ -100,7 +105,8 @@ gexc:
 # ---- the runtime's files (runtime/files/out) and its package ----
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
-# vite and wisp-js, which runtime/build.sh builds the package with, at package-lock.json's versions
+# vite and wisp-js, which runtime/build.sh builds the package with and runtime/app/build.sh
+# the pages, at package-lock.json's versions
 NPM_CI = [ $(ROOT)/runtime/node_modules/.package-lock.json -nt $(ROOT)/runtime/package-lock.json ] || (cd $(ROOT)/runtime && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others. Their
@@ -134,6 +140,22 @@ GEX_MESA_PAGE_ONLY ?= 1
 export GEX_MESA_PAGE_ONLY
 PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
 
+# gex's pages: the runtime's files for one flavour (runtime/files/build.sh),
+# then its dist (runtime/app/build.sh).
+page: toolchains
+	@$(EMCC_CHECK)
+	$(MESA_CHECKOUT)
+	$(NPM_CI)
+	GEX_NO_REFRESH_DIST=1 $(PAGE_ENV) $(ROOT)/runtime/files/build.sh --mp $(filter-out --debug,$(PAGE_FLAGS))
+	$(ROOT)/runtime/app/build.sh --mp $(filter --debug,$(PAGE_FLAGS))
+	@echo $(ROOT)/runtime/app/dist
+page-sp: toolchains
+	@$(EMCC_CHECK)
+	$(MESA_CHECKOUT)
+	$(NPM_CI)
+	GEX_NO_REFRESH_DIST=1 $(PAGE_ENV) $(ROOT)/runtime/files/build.sh --sp $(filter-out --debug,$(PAGE_FLAGS))
+	$(ROOT)/runtime/app/build.sh --sp $(filter --debug,$(PAGE_FLAGS))
+	@echo $(ROOT)/runtime/app/dist-sp
 assets: toolchains
 	$(ROOT)/runtime/files/build-assets.sh
 	@echo $(ROOT)/runtime/files/out
@@ -146,6 +168,10 @@ mesa:
 xwayland:
 	@$(EMCC_CHECK)
 	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --x-only
+PORT ?= 8088
+SP_PORT ?= 8089
+serve:
+	node $(ROOT)/runtime/app/serve.mjs $(PORT) --sp-port $(SP_PORT)
 PKG ?= $(OUT)/runtime
 runtime:
 	$(NPM_CI)
