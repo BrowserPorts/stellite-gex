@@ -31,7 +31,8 @@ prog-project/
   run.sh              the native launcher                           generated
   .gitignore          ignores build/                                generated
   user/               yours                                         created once
-    eject.json          settings: replacements, coverage, arguments, start defaults
+    eject.json          settings: replacements, coverage, arguments, start() defaults
+    index.html          the web build's page: an example that calls app.mjs's start()
     src/*.c             replacement functions
     files/              extra files for the guest's filesystem
   build/              build output (build.sh)
@@ -330,26 +331,85 @@ user/src/decompiled_ack.c: 1 function of C; bind it in user/eject.json with:
 
 ## The web build
 
-An eject writes data, never a page. A Wine page's build writes
-`build/web/`: the bundle (`rootfs.tar`), the units (`units/`) and the launch
-file (`wine32.json`: the program, its arguments, environment, working
-directory, size, the features kept and the units). A page runs it on the
-runtime package, `@gexemu/runtime` (runtime/README.md): a `System`, a
-filesystem with the bundle (`addTar`), the units (`units`), and the program
-from the launch file (`spawn`). Loading policy (what to fetch when, how the
-files are packed and cached, a loading screen) is the page's.
+The web build is a **library**, not a page. Whatever the project (a Linux
+program or a 32-bit Wine page), the browser half is `app.mjs` exporting
+`start()`, and the page that calls it is yours. `gexc eject` writes an
+example, `user/index.html`, once and never again:
+
+```html
+<script type="module">
+  import { start } from './app.mjs';
+  const app = await start({ container: document.body });
+  // app.exited (a promise of the exit status), app.kill(), app.resize('fit' | {w, h})
+</script>
+```
+
+Nothing about the page is special: any page that imports `app.mjs` and
+gives `start()` an element runs the program
+(`gexdev/tests/eject/wine32-shell-min.html` is a hand-written one, with its own box,
+arguments and `onExit`).
+
+**`start(options)`** resolves once the program runs, with
+`{ exited, kill(), resize(size), state, describe(), ready() }`. Its
+options, the handle and its errors are in `runtime/app/README.md`. An unknown option or a wrong value is an error that names
+it, and so is an option for a piece the build left out
+(`start({ compositor: true })` on a `"compositor": false` build names
+`"features": {"compositor": true}` in user/eject.json).
+
+### The loading screen
+
+The library draws nothing over the desktop while it starts; it says how far
+along it is, and the page draws that. `onProgress(p)` is called whenever
+the start-up moves (a few times a second at most while bytes arrive; at
+once on a phase change, when a file is whole, and when a fetch of the
+running program starts or ends), and the handle's `state.progress` holds
+the same, for a page that polls:
+
+| `p.` | What |
+| --- | --- |
+| `phase` | `'download'`, `'compile'`, `'boot'`, `'first-frame'`, `'ready'`, in that order and never back; then `'exited'` or `'failed'` |
+| `download` | `{done, total}` bytes as sent (compressed), `{filesDone, files}`; `cached`, the bytes of `done` the page already had (pieces kept from an earlier visit) |
+| `compile` | `{done, total}` units compiled ahead (they compile as they arrive) |
+| `at` | each phase's start, ms since `start()` |
+| `elapsed` | ms since `start()`, at this call |
+| `error` | with `'failed'`: why |
+| `fetch` | after the start, what the program is fetching, or `null` when nothing is in flight: `{kind, name, done, total, inflight}`. `kind` `'file'`: a lazy file, `name` its file name, `done` its bytes read so far, `total` its size. `kind` `'code'`: a unit of translated code, `name` the module it is for (`''` if not known), `done` its bytes once in, `total` 0. `inflight`: how many fetches are under way |
+| `boot` | from `'boot'` on, what the program has reached: `units` `{done, total}`, the build's units installed in some process so far, of all it ships; `programs` `{done, total}`, the same for the `.exe` images; `program`, the latest program started, and `image`, the latest image loaded (file names, or `null`). A build without units has totals of 0 |
+| `log` | the latest events, oldest first (at most 50): `{t, kind, text}`, `t` in ms since `start()`, `kind` `'phase'`, `'program'` (`Started X.exe`), `'image'` (`Loaded X.dll`) or `'fetch'` (the first fetch of a lazy file or a unit's code) |
+
+The totals are whole from the first call: a Wine page counts its bundle and
+units from the site's pack, a Linux program's page from its manifest. A
+Linux program without windows downloads until the launcher has read every
+file, then goes to `'boot'` and `'ready'` together.
+
+`'boot'` is the program's first process started, `'first-frame'` a window's
+first pixels in the page. `'ready'` is the first frame unless the build's
+`"start": {"ready": "manual"}` or the page's `ready: 'manual'` says the page
+decides: a program whose first window is a splash, or a desktop that paints
+its wallpaper long before its taskbar, calls `handle.ready()` when what it
+waits for is there (`describe()` says what the windows are).
+
+The library never reads the page's URL: the runtime's switches come from
+these options, and its files from `baseUrl`, so a site can live under any
+path.
 
 ### Build or start
 
 What changes the build's output (its wasm, its bundle, what ships) is
-`user/eject.json`, at build time. Everything else is how the page starts
-the program, whose defaults the build records in the launch file:
-user/eject.json `"start"` (`args`, `env`, `cwd`, `size`, `mtimes`, `strace`,
-`trapstack`, `filesystem`, `ready`) over the recording's. A `"start"` key for a
-build setting (`"compositor"`, say) fails the build and says where it goes.
-`"filesystem"` is required: `"memory"` or `{"kind": "opfs", "name": "..."}`
-(runtime README, "Persistence"). A new project's file says `"memory"`;
-a build whose file says neither fails.
+`user/eject.json`, at build time. Everything else is a `start()` option,
+whose default the build records: user/eject.json `"start"` (`args`, `env`,
+`cwd`, `size`, `mtimes`, `strace`, `trapstack`, `filesystem`, `ready`) over the
+recording's, and the page's options over both. A `"start"` key for a build
+setting (`"compositor"`, say) fails the build and says where it goes.
+`"filesystem"` is required: where the guest's files are kept, `"memory"`
+(gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
+origin private file system, which keeps the whole root, a game's saves and
+the Wine prefix included, across loads; runtime/README.md, "Persistence").
+One page holds a store at a time: a second tab of the site gets the
+page's `onStoreBusy` choice, or fails with EBUSY without one.
+A new project's file says `"memory"`; a build whose file says neither
+fails. The `"persist"` start option (one directory kept in IndexedDB) is
+gone and fails the build: what it saved is not read by an OPFS filesystem.
 
 ### A Linux program's web build
 
@@ -368,13 +428,18 @@ built with. `build.sh` then also writes `build/web/`:
   pins, replacements, the guest ABI the replacements are called with, and
   the syscall allow-list.
 
-The launcher, `runtime/web/eject.mjs`, under Node:
+Launchers, sharing `runtime/web/eject.mjs`:
 
 ```sh
-node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]
+node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
+node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
 
-Replacements are
+`app.mjs`'s `start()` is the Linux program's (`runtime/app/README.md`, "A
+Linux program's build").
+
+The page needs cross-origin isolation (gex's runtime uses
+`SharedArrayBuffer`); `serve.mjs` sends the two headers. Replacements are
 instantiated on the guest's memory and called with the same `c`/`ctx` ABI
 as natively. `build.sh` links `build/user.web.wasm` for them, since a module
 importing a shared memory will not link to the shim's plain one.
@@ -407,7 +472,7 @@ why, rather than doing nothing.
 
 | Feature | What it is | Off |
 | --- | --- | --- |
-| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code stays in the bundle: start() starts without it |
 | `gl` | the guest's OpenGL: Mesa on WebGPU | the page ships no Mesa |
 | `multiprocess` | more than one guest process | not yet: a Wine program is several processes |
 | `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the translator is not a separate build |
@@ -420,16 +485,22 @@ feature off fails its build.
 A 32-bit Wine program (Wine as native wasm32: every Wine process a guest
 process running `wine`, its PE side in `winepe.wasm`, the Windows images'
 code in function-tier units) runs on the same runtime as any gex page.
-Ejecting one makes a project of what a recorded run used, and its build
-writes the data a page runs it from:
+Ejecting one makes it the app library (above), built with the features you
+keep, and a standalone site around the project's page:
 
 ```sh
-# 1. record: run the page to its window (headless Chromium), writing
-#    rec/wine32-session.json
-# 2. eject: the bundle, the units it used, a build step
-gexc eject rec --out app-project --unit-cache UNITS --features -compositor
-# 3. build: build/web (rootfs.tar, units/, wine32.json)
+# 1. record: run the page to its window (headless Chromium); --boot-units-out
+#    also lists the images whose units it used shortly after the window
+node site/record-wine32.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
+  --boot-units-out rec/boot-units.txt
+# 2. eject: the bundle, the units it used, the runtime, a build step
+gexc eject rec --out app-project --web-src runtime --unit-cache UNITS --features -compositor
+# 3. build: the page with those features, the site's inputs in build/web
 app-project/build.sh
+# 4. the static site
+node site/eject-site.mjs app-project site --strip --prune --dedupe \
+  --pieces --boot-units rec/boot-units.txt
+node gexdev/tests/eject/wine32-page.mjs site      # check: the site reaches the program's window
 ```
 
 - **The recording** is how the page was started (exe, arguments,
@@ -438,13 +509,28 @@ app-project/build.sh
   the units each image used and the images that had none, and the native
   wasm32 modules (`wine`, `winepe.wasm`, wasm DLLs) by content key.
 - **The project** holds the recording (`session/`), the bundle
-  (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`) and
-  `gex-project.json`.
-- **The build** (`gexc eject build`) writes `build/web/`: `rootfs.tar` (with
-  user/eject.json's prefix settings, splits and pins), `units/`, and the
-  launch file with the features kept and user/eject.json `"start"`. A page
-  leaves out what a feature off names (no Mesa for `gl`, `HostWindows` or
-  `SingleCanvas` for `compositor`).
+  (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
+  browser shim, kernel and seed (`runtime/web/gex/`), `gex-project.json` and
+  the page, `user/index.html` (written once, yours). `page_source` names the
+  gex checkout's `runtime/`: the library is built at build time, because the
+  features decide how it starts.
+- **The build** (`gexc eject build`) runs `site/build-eject-page.sh` with the
+  features switched off, puts the project's runtime wasm in it, drops what a
+  feature off ships (Mesa for `gl`), and writes `build/web/` (`page/`: the app library,
+  `rootfs.tar`, `units/`, and the launch file with user/eject.json
+  `"start"`).
+- **The site** (`site/eject-site.mjs`) is the project's page at `/`, the app
+  library as plain files, the bundle and the units as `FILE.zst` with a
+  preload list, `pack.json` (their sizes and the build id) and the hosting
+  files (`serve.mjs`, `_headers`). There is no service worker: the host
+  sends the isolation headers (COOP `same-origin`, COEP `require-corp`), and
+  the library fetches each packed file and decodes it itself, straight into
+  the buffer that is then moved to the first process's Worker. One copy of
+  the bundle stays resident: the kernel's. The browser's HTTP cache does the
+  caching (`FILE.zst?v=BUILD`).
+
+Everything else is the page as gex runs it: several processes, the kernel,
+run-time translation behind the units.
 
 ### The bundle split
 
@@ -456,9 +542,12 @@ without it means `"whole"`) ships only those files in the site's bundle:
   recorder keeps the set as the session's `files_read`.
 - **Build:** `gexc eject build` puts that list in the launch file; a split
   without a read set fails the build and says so.
-- **Site:** the site's builder keeps the read files (and the loader) in
-  the bundle and makes every other file a lazy file (`addTar(..., { lazy })`):
-  a guest that reads one gets it from the host in ranges, the first time.
+- **Site:** `site/eject-site.mjs` keeps the read files (and the loader) in
+  `rootfs.tar` and makes every other file a lazy file: stored once by
+  content as `project/build/web/lazy/SHA`, listed with its size and time in
+  `lazy.json`. A guest that reads one gets it from the host in 1 MiB ranges,
+  synchronously, the first time; the site's `serve.mjs` answers ranges (a
+  host without them still works, sending the whole file per read).
 
 `"bundle": "title"`, the default `gexc eject` writes for a game, is the same
 split cut at the title window: the bundle holds only what the run had opened
@@ -517,8 +606,10 @@ fails the image is shipped whole, and the build says so.
 
 A unit holds every function of its image, and a run to the window calls a
 small fraction of them. The default (`"cold": "none"`) ships every unit
-whole: the page compiles every module it is given (System's `units`)
-while the bundle downloads; nothing is fetched on a call.
+whole, in one archive: `site/eject-site.mjs` tars every unit into
+`project/build/web/units.tar`, packed as one zstd file. The page decodes it
+once and compiles every module while the bundle downloads; nothing is
+fetched on a call.
 
 A split is opt-in: a clustering in `"cold"` ships only the functions the
 recording ran up front. The rest are fetched the first time something calls
@@ -526,8 +617,10 @@ one. Everything is still compiled ahead of time at build time, and nothing
 is lifted in the page.
 
 - **Coverage.** Build with `"cold": "instrument"`. Every guest function of
-  every unit then reports itself on entry. A recorder that runs that build
-  adds the run's functions to the recording the project is ejected from. Runs add up: record the paths users take. Then eject again
+  every unit then reports itself on entry. Record that site with
+  `record-wine32.mjs URL OUT --serve SITE --coverage-into REC/wine32-session.json`,
+  which adds the run's functions to the recording the project is ejected
+  from. Runs add up: record the paths users take. Then eject again
   (`user/` is kept) and set the clustering.
 - **Build.** For each unit, `gexc eject build` keeps the functions in the
   recording's coverage in its primary module. Every other slot gets a stub
@@ -535,8 +628,8 @@ is lifted in the page.
   functions go into cluster modules (`gex-split`), position-independent
   modules with the primary's imports that fill their own slots. The entry
   list does not change, so the runtime sees the same unit.
-- **Site.** The site packs each unit's clusters (`cold/N.wasm`), one zstd
-  frame per cluster, plus an index. On a cluster's first call the
+- **Site.** `site/eject-site.mjs` packs each unit's clusters into `cold.bin`,
+  one zstd frame per cluster, plus an index. On a cluster's first call the
   Worker fetches the frame with a synchronous Range request, decodes it,
   compiles it, shares the module with its siblings and instantiates it into
   the table. The Worker that runs the call blocks for that time, as for a
@@ -658,7 +751,7 @@ description (`HKLM\Hardware\Description\System`: processor, BIOS), the
 active computer name and the user's volatile environment. They come from
 the recording: a page run with `WINEGEX_RECORD_HARDWARE=1` in its
 environment has wineboot write them as `[gex-record] reg` lines, which
-the recorder keeps as the session's `volatile_keys`. The build
+`record-wine32.mjs` keeps as the session's `volatile_keys`. The build
 writes them into the prefix's `system.reg` and `user.reg` as ordinary keys
 and starts the page with `WINEGEX_NO_WINEBOOT=1`: the first process sets up
 the session's shared data and marks it booted itself. A recording without

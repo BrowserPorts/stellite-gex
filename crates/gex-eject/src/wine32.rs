@@ -5,9 +5,10 @@
 //! wineserver, services, the program and its helpers are each a guest
 //! process running `wine` (a native wasm32 program) with Wine's PE side
 //! (`winepe.wasm`) loading the Windows images, whose code is function-tier
-//! units keyed by content. Its project is what the recording says it used,
-//! and the features the user keeps (`user/eject.json` `"features"`,
-//! crate::features) say how a page should run it:
+//! units keyed by content. It runs in the same page (`nt.html`) a gex demo
+//! does, so its project is that page, built with the features the user keeps
+//! (`user/eject.json` `"features"`, crate::features), plus what the
+//! recording says it used:
 //!
 //! ```text
 //! project/
@@ -16,15 +17,19 @@
 //!   session/            wine32-session.json, the recording             generated
 //!   bundle/rootfs.tar   the filesystem the page fetched            generated
 //!   units/KEY/          the units the recording used               generated
+//!   runtime/web/gex/    the browser shim, kernel and seed          generated
 //!   build.sh            the build step                             generated
 //!   user/eject.json     yours: features, ...                       created once
-//!   build/web/          the site's inputs (build.sh): rootfs.tar,
-//!                       units/, wine32.json (how to start it)
+//!   build/web/          the site's inputs (build.sh): page/, rootfs.tar,
+//!                       units/, wine32.json
 //! ```
 //!
-//! Recording: a recorder (headless Chromium) runs a 32-bit Wine page to a
-//! window title and writes `wine32-session.json`. The build writes data
-//! only: a page runs it on @gexemu/runtime, from wine32.json.
+//! Recording: `site/record-wine32.mjs` (headless Chromium) runs a 32-bit Wine page
+//! to a window title and writes `wine32-session.json`. The page is built by the
+//! gex checkout the project names (`page_source`, `site/build-eject-page.sh`),
+//! since it is the features that decide what goes into it; the runtime's
+//! wasm is the project's own copy. `site/eject-site.mjs PROJECT OUT` makes
+//! the static site.
 
 use crate::config::Config;
 use crate::eject::{prepare, sha256, write_file};
@@ -46,10 +51,25 @@ pub const KIND_OLD: &str = "w3";
 pub const FORMAT: &str = "gex-wine32-session";
 pub const FORMAT_OLD: &str = "gex-w3-session";
 
+/// The runtime's wasm the page loads from `gex/` (site/build-eject-page.sh).
+const RUNTIME_WASM: &[&str] = &["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
+/// The memory64 runtime (`GEX_MEM64=1 hosts/browser/build.sh`) a 64-bit Wine
+/// page runs a program marked for memory64 on.
+const RUNTIME_WASM_M64: &[&str] = &["gex_browser.x86.m64.shared.wasm", "seed.x86.m64.shared.wasm"];
+
 /// Whether a recorded page runs 64-bit Wine: its loader is Wine's
 /// `x86_64-unix` one.
 fn is_wine64(page: &Json) -> bool {
     json::opt_str(page, "exe").is_some_and(|e| e.contains("/x86_64-unix/"))
+}
+
+/// The runtime wasm a page of this kind ships.
+fn runtime_wasm(wine64: bool) -> Vec<&'static str> {
+    let mut v = RUNTIME_WASM.to_vec();
+    if wine64 {
+        v.extend_from_slice(RUNTIME_WASM_M64);
+    }
+    v
 }
 
 /// Whether `record` holds a 32-bit Wine recording.
@@ -66,6 +86,10 @@ pub fn is_project(dir: &Path) -> bool {
 }
 
 pub struct Wine32Options {
+    /// The gex checkout's `runtime/` directory: the app library's source
+    /// (`src/host/app.js`), and the built runtime under `files/out/gex/`
+    /// (`../site/build-eject-page.sh` beside it).
+    pub web_src: PathBuf,
     /// Where the units the recording names are (a unit cache: KEY/c.wasm).
     pub unit_cache: Vec<PathBuf>,
     /// The runtime's features a new project's `user/eject.json` switches off.
@@ -194,7 +218,7 @@ fn add_trampolines(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> Res
 /// `base`. The trampolines' unit, added by the eject (no recorded entry),
 /// is used by every 32-bit process from its first system call: `at` 0, so
 /// the page compiles it with the boot's units and packs it in the boot
-/// archive (the site's), never as a unit compiled when first mapped,
+/// archive (site/eject-site.mjs), never as a unit compiled when first mapped,
 /// which no process maps.
 fn units_json(recorded: &[Json], units: &[(String, String)]) -> Json {
     Json::Arr(units.iter().enumerate().map(|(i, (k, p))| {
@@ -223,6 +247,30 @@ fn provider_file(p: &gex_cgen::provider::Provider) -> String {
     let f = gex_cgen::provider::fingerprint(std::slice::from_ref(p));
     gex_abi::set_kuser_fold(was);
     format!("providers/{}-{f}.wasm", p.name)
+}
+
+/// A release page's runtime wasm without its names and DWARF, as
+/// build-eject-page.sh strips the copies it makes (user 10-30: every release
+/// build); `GEX_KEEP_NAMES=1` keeps them, for a debug page. Written to a new
+/// file and renamed over `path`, which may be a hard link to the project's
+/// runtime copy.
+fn strip_release(path: &Path) -> Result<()> {
+    if std::env::var_os("GEX_KEEP_NAMES").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("wasm.strip");
+    let st = std::process::Command::new("wasm-tools")
+        .args(["strip", "-d", "^name$", "-d", "^\\.debug_.*", "-d", "^external_debug_info$", "-d", "^sourceMappingURL$"])
+        .arg(path)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("running wasm-tools strip on {} (or GEX_KEEP_NAMES=1)", path.display()))?;
+    if !st.success() {
+        bail!("wasm-tools strip {} failed ({st})", path.display());
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
@@ -269,6 +317,14 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         add_trampolines64(&mut units, &o.unit_cache)?;
     } else if class32(&bundle_bytes, &units)? {
         add_trampolines(&mut units, &o.unit_cache)?;
+    }
+    for f in runtime_wasm(wine64) {
+        if !o.web_src.join("files/out/gex").join(f).is_file() {
+            bail!("{}: no files/out/gex/{f}: build the shim and kernel first (hosts/browser/build.sh, hosts/kernel/build.sh)", o.web_src.display());
+        }
+    }
+    if !o.web_src.join("../site/build-eject-page.sh").is_file() {
+        bail!("{} is not gex's runtime/ directory (no ../site/build-eject-page.sh)", o.web_src.display());
     }
     crate::features::check(&o.features_off)?;
 
@@ -318,13 +374,18 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         sum.unit_bytes += link_or_copy(&src, &out.join("units").join(&file))?;
         sum.providers += 1;
     }
-    // The gexc that builds it.
+    // The runtime: the browser shim, kernel and seed this page runs, and the
+    // gexc that builds it.
+    for f in runtime_wasm(wine64) {
+        link_or_copy(&o.web_src.join("files/out/gex").join(f), &out.join("runtime/web/gex").join(f))?;
+    }
     link_or_copy(runtime, &out.join("runtime/gexc"))?;
 
     let processes = list(&v, "processes");
     let modules = list(&v, "modules");
     sum.processes = processes.len();
     sum.modules = modules.len();
+    let web_src = std::fs::canonicalize(&o.web_src).unwrap_or_else(|_| o.web_src.clone());
     let project = obj(vec![
         ("kind", s(if wine64 { KIND64 } else { KIND })),
         ("about", s("A Wine page (Wine's Unix side as native wasm) ejected by gexc eject; see crates/gex-eject/README.md, \"Wine pages\". Generated: rewritten by every eject.")),
@@ -334,7 +395,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         ("processes", Json::Arr(processes.to_vec())),
         // Each with `at`, when the recording first used it (seconds; none
         // from an older recorder): a unit first used after the title is
-        // compiled when a process maps it (the site's `demand`).
+        // compiled when a process maps it (site/eject-site.mjs, `demand`).
         ("units", units_json(list(&v, "units"), &units)),
         ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
@@ -359,6 +420,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         // `volatile_keys`, from a page run with WINEGEX_RECORD_HARDWARE=1;
         // null without): what `"wineboot": "skip"` writes into the prefix.
         ("volatile_keys", v.get("volatile_keys").cloned().unwrap_or(Json::Null)),
+        ("page_source", s(web_src.display().to_string())),
         ("session", s(sha256(text.as_bytes()))),
     ]);
     write_file(&out.join(crate::project::PROJECT_FILE), json::write(&project).as_bytes(), false)?;
@@ -371,13 +433,15 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         let shell = strip_dir(&exe).eq_ignore_ascii_case("explorer.exe");
         write_file(&out.join(crate::config::CONFIG_FILE), template(&o.features_off, wine64, !shell).as_bytes(), false)?;
     }
+    // The page: the user's, an example to start from (app.mjs's start()).
+    crate::web::write_shell(out)?;
     Ok(sum)
 }
 
 const BUILD_SH: &str = "#!/bin/sh
 # Generated by `gexc eject`: build this wine32 page's site inputs into build/web
-# (the bundle, the units, and wine32.json: how a page starts it, with
-# user/eject.json's features).
+# (the page with user/eject.json's features, the bundle, the units).
+# Then: node <gex>/site/eject-site.mjs . SITE
 set -e
 cd \"$(dirname \"$0\")\"
 exec runtime/gexc eject build .
@@ -842,7 +906,7 @@ fn title_read_set(v: &Json, after: u32, wineboot_skip: bool) -> Result<Option<(V
                 .collect(),
             _ => bail!(
                 "user/eject.json says \"title_after\": {after}, but the recording has no files_read_at \
-                 (record with a recorder that has the read times)"
+                 (record with a site/record-wine32.mjs that has the read times)"
             ),
         }
     } else {
@@ -1127,11 +1191,12 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 #[derive(Debug, Default)]
 pub struct Wine32Report {
     pub features_off: Vec<String>,
+    pub page_files: usize,
     pub units: usize,
 }
 
 /// A new 32-bit Wine project's `"cold"`: none. Every unit ships whole, in the site's
-/// one units archive (the site's), and nothing is fetched on a call.
+/// one units archive (site/eject-site.mjs), and nothing is fetched on a call.
 /// A split (`"chunk:256"` and the other clusterings) is opt-in: it cuts the
 /// download and costs a fetch per cluster at first call (crates/gex-eject/README.md,
 /// "Cold code").
@@ -1161,9 +1226,74 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     }
     std::fs::create_dir_all(&web)?;
 
+    // The page, built with the features kept: a feature off is start()'s
+    // choice made when it is built (GEX_FEATURES_OFF, the bundler's define)
+    // or files not shipped.
+    let mut src = PathBuf::from(json::str_field(&v, "page_source", what)?);
+    // A project ejected before gex's page/ became runtime/ names <gex>/page:
+    // the same checkout's runtime/ is its source now.
+    if !src.join("../site/build-eject-page.sh").is_file() {
+        if let Some(gex) = src.parent().filter(|g| g.join("site/build-eject-page.sh").is_file()) {
+            src = gex.join("runtime");
+        }
+    }
+    let page = web.join("page");
+    let st = std::process::Command::new("sh")
+        .arg(src.join("../site/build-eject-page.sh"))
+        .arg(&page)
+        .env("GEX_FEATURES_OFF", off.join(","))
+        .status()
+        .with_context(|| format!("running {}/../site/build-eject-page.sh", src.display()))?;
+    if !st.success() {
+        bail!("{}/../site/build-eject-page.sh failed ({st})", src.display());
+    }
+    // The runtime is the project's, not whatever the checkout has built since.
+    for f in runtime_wasm(wine64) {
+        let to = page.join("gex").join(f);
+        let _ = std::fs::remove_file(&to);
+        link_or_copy(&dir.join("runtime/web/gex").join(f), &to)?;
+        strip_release(&to)?;
+    }
+    // GL kept, but the checkout has no Mesa built (ports/mesa/build.sh):
+    // the page would answer the guest's first GL request with a device that
+    // cannot start. The build is one without GL instead, which the guest
+    // sees as no /dev/gex-gl at all.
+    if !off.iter().any(|x| x == "gl") && !page.join("gex/gex-wgpu-replay.js").is_file() {
+        eprintln!("gexc eject build: {} has no Mesa (ports/mesa/build.sh): the page is built without GL", src.display());
+        off.push("gl".to_string());
+    }
+    let has = |f: &str| !off.iter().any(|x| x == f);
+    if !has("gl") {
+        for e in std::fs::read_dir(page.join("gex"))? {
+            let e = e?;
+            if e.file_name().to_string_lossy().starts_with("gex-wgpu-replay") {
+                std::fs::remove_file(e.path())?;
+            }
+        }
+    }
+    // `"compositor": false` leaves the library's code as it is (no bundle is
+    // built without the compositor now): the launch file's features make
+    // start() draw each window into the page instead.
+    if !page.join("app.mjs").is_file() {
+        bail!("{}/../site/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
+    }
+    crate::web::check_no_test_page(&page)?;
+    let mut page_files = 0;
+    let mut stack = vec![page.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                stack.push(e.path());
+            } else {
+                page_files += 1;
+            }
+        }
+    }
+
     // The bundle and the units: as they are, or with `"cold"` each unit's
     // primary (the functions the run called, a stub for every other) and
-    // its cold clusters, `cold/N.wasm` (the site packs them).
+    // its cold clusters, `cold/N.wasm` (site/eject-site.mjs packs them).
     let units = list(&v, "units");
     // `"resources": "trim"`: the bundle with the resources no lookup returns
     // zeroed, and each trimmed image's unit under the key the page computes
@@ -1216,7 +1346,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
             eprintln!(
                 "gexc eject build: user/eject.json says \"cold\", but the recording has no coverage: \
                  the units stay whole (crates/gex-eject/README.md, \"Cold code\": record a site built with \
-                 \"cold\": \"instrument\" with a recorder that takes coverage)"
+                 \"cold\": \"instrument\" with record-wine32.mjs --coverage-into)"
             );
             None
         }
@@ -1416,7 +1546,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         params.push(("fjit".to_string(), s("1")));
     }
     // `"bundle": "split"`: the files the recorded run opened, which the site
-    // keeps in its bundle (the site's); `"title"`: those it opened up
+    // keeps in its bundle (site/eject-site.mjs); `"title"`: those it opened up
     // to its title window.
     let bundle = if config.bundle_split {
         let (read, read_set) = bundle_read_set(&v, &config)?;
@@ -1430,7 +1560,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
             }
             _ => bail!(
                 "user/eject.json says \"bundle\": \"{}\", but the recording has no {read_set} \
-                 (record with a recorder and page that have the read set, or set \"bundle\": \"whole\")",
+                 (record with a site/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")",
                 if config.bundle_title { "title" } else { "split" }
             ),
         }
@@ -1504,6 +1634,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
             ("features_off", strs(&off)),
             ("config", s(sha256(&config_bytes))),
             ("session", v.get("session").cloned().unwrap_or(Json::Null)),
+            ("page_files", json::n(page_files as u64)),
             ("units", json::n(units.len() as u64)),
             ("bundle_split", json::b(config.bundle_split)),
             ("cold", config.cold.as_deref().map(s).unwrap_or(Json::Null)),
@@ -1512,7 +1643,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         .as_bytes(),
         false,
     )?;
-    Ok(Wine32Report { features_off: off, units: units.len() })
+    Ok(Wine32Report { features_off: off, page_files, units: units.len() })
 }
 
 #[cfg(test)]
@@ -1729,7 +1860,7 @@ mod tests {
 
     #[test]
     fn the_trampoline_unit_is_packed_with_the_boot() {
-        // the site compiles with the page (and counts in its boot
+        // eject-site.mjs compiles with the page (and counts in its boot
         // archive) a unit whose `at` is at most the title's seconds; one
         // with no `at` is left for the process that maps it, and none maps
         // the trampolines' unit.

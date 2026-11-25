@@ -28,7 +28,7 @@ It runs Linux programs for AArch64, x86-64 and i386, wasm32 Linux programs
 built with its own compiler (`toolchain/gexcc`), and Windows programs through
 Wine. Wayland and X11 programs share one desktop, and OpenGL goes through
 Mesa, compiled to WebAssembly, onto the browser's WebGPU. The same programs
-run in a browser page (`page/`) and natively under `gexc`, on wasmtime.
+run in a browser page (`runtime/`) and natively under `gexc`, on wasmtime.
 
 Upstream's README describes the engine, its tiers and its layout in full.
 
@@ -42,6 +42,14 @@ Upstream's README describes the engine, its tiers and its layout in full.
 
 ## What this fork adds
 
+- **The app library and its sites.** Upstream gex took out its page app,
+  its pages and ejected programs' sites in favour of the runtime package
+  alone. Stellite's players run on them, so this fork keeps them on
+  upstream's layout: the app library, `start()`
+  (`runtime/src/host/app.js`, `runtime/app/README.md`), gex's test pages
+  (`runtime/app`), the eject site (`site/`, `gexc eject --web-src
+  <gex>/runtime`), the page's owner of the lazy files, which keeps them in
+  Cache Storage, and the background fill.
 - **Wine.** 64-bit Wine with WoW64 (`make wine`) is built from wine-stellite
   at the commit in `wine/wine.pins`. Wine Mono goes into the install with
   `WINE64_MONO=1`. With `WINE64_EXTRA_DLLS`, dirk's D3D11 and DXGI are linked
@@ -76,8 +84,8 @@ its last line.
 
 ```console
 $ make gexc      # gexc for AArch64, x86-64 and i386 guests
-$ make page      # the page, multi-process build, in page/dist
-$ make serve     # page/dist at http://localhost:8088/
+$ make page      # gex's pages, multi-process build, in runtime/app/dist
+$ make serve     # runtime/app/dist at http://localhost:8088/
 $ make wine      # 64-bit Wine with WoW64, and a prefix
 $ make test      # the runtime tests: node test/run.mjs (ARGS= passes options)
 $ make check     # cargo test, the workspace
@@ -110,26 +118,32 @@ $ target/release/gexc run hello          # an AArch64 guest
 $ target/x86/release/gexc run hello      # an x86-64 or i386 guest
 ```
 
-A Windows program, in the page:
+A Windows program, natively:
 
 ```console
 $ make wine
 $ . out/wine.env
-$ wine/run.sh --page TREE --dist $WINE64_DIST --prefix $WINE64_PREFIX app.exe
+$ wine/run.sh --dist $WINE64_DIST --prefix $WINE64_PREFIX app.exe
 ```
 
 `make wine` prints `WINE64_DIST=`, `WINE64_PREFIX=` and `WINE64_NATIVE=`, and
 saves them in `out/wine.env`. `wine/run.sh -h` gives the runner's options.
+In the page, a Windows program runs from gex's Wine test page,
+`runtime/app/nt.html`, whose query names the bundle and the program
+(`runtime/src/host/nt-page.js`).
 
 To use gex from a page of your own, build the runtime package with
-`make runtime` and follow `page/runtime/README.md`.
+`make runtime` and follow `runtime/README.md`, or build the app library
+(`runtime/app/build.sh --lib DIR`) and call its `start()`
+(`runtime/app/README.md`).
 
 ## Documentation in the tree
 
 | file | covers |
 |------|--------|
-| `page/README.md` | the page's two builds, and ejected programs' sites |
-| `page/runtime/README.md` | the runtime API, `@gexemu/runtime` |
+| `runtime/files/README.md` | the runtime's files and their two builds |
+| `runtime/README.md` | the runtime API, `@gexemu/runtime` |
+| `runtime/app/README.md` | the app library, `start()`, and gex's pages |
 | `wine/README.md` | building Wine, running a program on it, known gaps |
 | `toolchain/README.md` | gexcc and the sysroots |
 | `crates/gex-eject/README.md` | ejected projects, built ahead of time |

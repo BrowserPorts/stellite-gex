@@ -146,6 +146,40 @@ build's other options and ignores them, so one page can start either kind.
 It has no desktop: `resize()` and `describe()` return `null`. The run is on
 the page's thread, so `kill()` stops waiting for it and hearing it.
 
+## gex's pages
+
+`runtime/app/build.sh` builds gex's own pages over the runtime's files
+(`runtime/files/out`, `runtime/files/README.md`): the test page
+(`index.html`, `runtime/src/host/harness.js`) and the Wine test page
+(`nt.html`, `runtime/src/host/nt-page.js`), one dist per build. Each
+build writes its bundler config over `config.mjs`; none is a Vite app.
+
+| build | dist | hosting |
+|-------|------|---------|
+| multi-process (default) | `runtime/app/dist` | needs COOP/COEP (SharedArrayBuffer) |
+| single-thread | `runtime/app/dist-sp` | any static host |
+
+```console
+$ make page                  # the runtime's files, then runtime/app/dist
+$ make page-sp               # the same for runtime/app/dist-sp
+$ make serve                 # runtime/app/dist at :8088, runtime/app/dist-sp at :8089
+```
+
+The dists ship stripped wasm. Unstripped copies stay in
+`target/web-debug/<mp|sp>/`, and `PAGE_FLAGS=--debug` ships them instead.
+`runtime/app/build.sh --lib DIR` builds `app.mjs` alone, for a page that
+brings the runtime's files itself.
+
+## Ejected programs
+
+`make eject-page DIR=...` (`site/build-eject-page.sh`) builds the library
+an ejected project ships, with the runtime's files it loads. `make
+eject-site PROJECT=... SITE=...` (`site/eject-site.mjs`) packs a built
+32-bit Wine project into a static site: the library, its runtime and
+Mesa, zstd-compressed assets, and the headers the host must send.
+`site/record-wine32.mjs` records the session a project is ejected from,
+on `nt.html`. crates/gex-eject/README.md has the whole flow.
+
 ## Not the API
 
 The following can change without notice:

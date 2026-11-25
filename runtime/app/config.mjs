@@ -30,6 +30,12 @@ const pageMode = {
 
 export default {
   plugins: [pageMode],
+  // gex-eject's feature selection (crates/gex-eject/README.md):
+  // GEX_FEATURES_OFF=compositor,... builds the library with start()'s
+  // compositor off (app.js, nt-page.js `__GEX_COMPOSITOR__`).
+  define: {
+    __GEX_COMPOSITOR__: JSON.stringify(!(process.env.GEX_FEATURES_OFF || '').split(',').includes('compositor')),
+  },
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 2048,

@@ -16,8 +16,10 @@ modules it is made of (`runtime/src/`), and the builds of what it loads into
 - the guest root filesystems come from the debdemo repository, which
   writes them into `runtime/files/out/rootfs`.
 
-gex has no page, site or app of its own. A page imports the package and
-decides how its files arrive (`runtime/README.md`).
+A page imports the package and decides how its files arrive
+(`runtime/README.md`). gex's own pages, the app library an ejected
+program ships and its sites are built over these files too
+(`runtime/app/README.md`).
 
 ## The two builds
 

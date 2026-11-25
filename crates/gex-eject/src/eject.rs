@@ -29,9 +29,9 @@ pub const GENERATED: &[&str] = &[
     "build.sh",
     "run.sh",
     "run.mjs",
-    // An older project's page and its server: an eject writes no page now
-    // (a page runs the project on @gexemu/runtime), and removes these.
     "serve.mjs",
+    // The app library's entry (a Linux program's `start()`); index.html is
+    // the user's now (user/index.html), removed here from older projects.
     "app.mjs",
     "index.html",
     ".gitignore",
@@ -390,9 +390,13 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("build.sh"), templates::build_sh().as_bytes(), true)?;
     write_file(&out.join("run.sh"), templates::run_sh().as_bytes(), true)?;
     write_file(&out.join(".gitignore"), templates::GITIGNORE.as_bytes(), false)?;
-    // The Node launcher, and the browser runtime when there is one: without
-    // it it says so. No page: a page runs the project on @gexemu/runtime.
+    // The web launchers, and the browser runtime when there is one: without
+    // it they say so. The page is the user's (user/index.html, written once),
+    // and calls the app library (app.mjs's `start()`).
     write_file(&out.join("run.mjs"), crate::web::RUN_MJS.as_bytes(), true)?;
+    write_file(&out.join("app.mjs"), crate::web::APP_MJS.as_bytes(), false)?;
+    crate::web::write_shell(out)?;
+    write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
     write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
     write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
     for (f, text) in crate::web::GEX_MJS_DEPS {

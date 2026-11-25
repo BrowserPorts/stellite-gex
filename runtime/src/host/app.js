@@ -39,7 +39,10 @@ import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 import { pageUser } from './wine-user.js';
 import { PageDrag } from './drag.js';
 
-/** Whether this build has the scene compositor: see runtime.js. */
+/** Whether this build has the scene compositor: a Wine project's build with
+ *  `"compositor": false` defines `__GEX_COMPOSITOR__` false
+ *  (GEX_FEATURES_OFF, runtime/app/config.mjs). The runtime's own modules no
+ *  longer leave the compositor out, so only the start-up's choice changes. */
 const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
 
 /** What the user's eject.json says for each piece a start option may ask for. */

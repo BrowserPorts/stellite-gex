@@ -58,7 +58,7 @@ GEXCC_PREFIX ?= $(OUT)/gexcc
 
 .PHONY: help help-all help-tools gexc page page-sp assets mesa xwayland serve runtime \
         sysroot sysroot64 busybox gexcc gexcc-win wine wine-x64 native-libs steam-api \
-        test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
+        eject-page eject-site test check check-gl regen-gl regen-mesa-hot lint wine32 toolchains \
         musl-src musl64-src llvm-src wine64-src
 
 help:
@@ -85,6 +85,8 @@ help-all: help
 	@echo 'make wine-x64      64-bit Wine without WoW64'
 	@echo 'make native-libs   zlib, zstd, SQLite as LP64 wasm replacements (ZLIB_SRC, ZSTD_SRC, SQLITE_SRC)'
 	@echo 'make steam-api     libsteam_api for games (STEAM_API_JSON; out/steam)'
+	@echo 'make eject-page    an ejected program'"'"'s page library (DIR=, default out/eject-page)'
+	@echo 'make eject-site    an ejected program'"'"'s static site (PROJECT=, SITE=)'
 	@echo 'make check         cargo test, the workspace (X86=1: with the x86 features)'
 	@echo 'make check-gl      the GL tables match their generators'
 	@echo 'make regen-gl      rewrite the GL tables from the Khronos registry'
@@ -256,6 +258,17 @@ steam-api:
 	@[ -n "$(STEAM_API_JSON)" ] || { echo "make steam-api: set STEAM_API_JSON (the Steamworks SDK's steam_api.json)"; exit 1; }
 	sh $(ROOT)/guest/steam/build.sh $(OUT)/steam
 	@echo $(OUT)/steam
+
+# ---- ejected programs ----
+DIR ?= $(OUT)/eject-page
+eject-page:
+	$(NPM_CI)
+	$(ROOT)/site/build-eject-page.sh $(DIR)
+	@echo $(DIR)
+eject-site:
+	@[ -n "$(PROJECT)" ] && [ -n "$(SITE)" ] || { echo "make eject-site: set PROJECT (an ejected project) and SITE (the output directory)"; exit 1; }
+	node $(ROOT)/site/eject-site.mjs $(PROJECT) $(SITE) $(SITE_ARGS)
+	@echo $(SITE)
 
 # ---- tests and checks ----
 test: runtime

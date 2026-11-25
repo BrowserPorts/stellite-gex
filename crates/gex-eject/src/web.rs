@@ -1,6 +1,6 @@
 //! The web build of a project: the browser shim (gex's runtime compiled to
-//! wasm) running the same program in Node (`run.mjs`). A page runs the
-//! project's files on @gexemu/runtime; an eject writes none.
+//! wasm) running the same program, in Node (`run.mjs`) or a page
+//! (the user's `user/index.html`, which calls `app.mjs`'s `start()`).
 //!
 //! An eject given `--web-shim` copies the shim into `runtime/web/`, beside the
 //! `gex.mjs` its gexc was built with. `build.sh` then also translates the
@@ -279,6 +279,60 @@ pub const EJECT_MJS: &str = include_str!("eject.mjs");
 
 /// `run.mjs`: the Node launcher.
 pub const RUN_MJS: &str = include_str!("run.mjs");
+
+/// `serve.mjs`: a static server for the page (`user/index.html` at `/`, the
+/// project's files beside it). gex's runtime needs
+/// `SharedArrayBuffer`, so the page must be cross-origin isolated (the two
+/// headers below); a plain static server is not enough.
+pub const SERVE_MJS: &str = include_str!("serve.mjs");
+
+/// `user/index.html`: the example page, the same for every kind of project
+/// (a Linux program, a 32-bit Wine page). Written once; the user's
+/// from then on. Everything the program needs is the app library's
+/// (`app.mjs`, `start()`): the page only gives it an element. Its own file,
+/// so a site put together without `gexc eject` can copy it as it is.
+pub const SHELL_HTML: &str = include_str!("index.html");
+
+/// Fail if a built web directory has or names `nt.html`: gex's test page is
+/// never part of an ejected build (the page is the user's).
+pub fn check_no_test_page(dir: &Path) -> Result<()> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let e = e?;
+            let p = e.path();
+            if e.file_type()?.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name == "nt.html" {
+                anyhow::bail!("{} is gex's test page, which an ejected build never ships", p.display());
+            }
+            if [".js", ".mjs", ".html", ".json"].iter().any(|x| name.ends_with(x)) {
+                let b = std::fs::read(&p)?;
+                if b.windows(7).any(|w| w == b"nt.html") {
+                    anyhow::bail!("{} names nt.html (gex's test page), which an ejected build never ships", p.display());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the example page to `user/index.html` unless the user has one.
+pub fn write_shell(out: &Path) -> Result<()> {
+    let p = out.join("user/index.html");
+    if !p.exists() {
+        crate::eject::write_file(&p, SHELL_HTML.as_bytes(), false)?;
+    }
+    Ok(())
+}
+
+/// `app.mjs` of a Linux program's project: the app library's `start()` on
+/// the single-Worker launcher (`runtime/web/eject.mjs`), so the page is the
+/// same as for every other kind of project.
+pub const APP_MJS: &str = include_str!("app.mjs");
 
 #[cfg(test)]
 mod tests {
