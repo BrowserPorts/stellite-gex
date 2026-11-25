@@ -49,5 +49,5 @@ export default {
   // every guest Worker from one fetched copy of its module graph
   // (worker-graph.js), which a cycle defeats: each Worker then fetched its
   // files again, ~27 MB a desktop start on an origin without an HTTP cache.
-  worker: { format: 'es', plugins: () => [pageMode], rolldownOptions: { output: { inlineDynamicImports: true } } },
+  worker: { format: 'es', plugins: () => [pageMode], rolldownOptions: { output: { codeSplitting: false } } },
 };

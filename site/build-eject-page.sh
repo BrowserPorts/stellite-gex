@@ -45,7 +45,7 @@ export default {
              // store.mjs its Store.
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: (c) => (c.name === 'app' || c.name === 'store' ? \`\${c.name}.mjs\` : 'assets/[name]-[hash].js'),
-                       inlineDynamicImports: $ONE },
+                       codeSplitting: !$ONE },
            } },
 };
 CFG
