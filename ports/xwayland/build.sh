@@ -642,11 +642,10 @@ p = f'{sys.argv[1]}/src/meson.build'
 s = open(p).read()
 if 'static_library' not in s:
     s = s.replace("library('xkbfile',", "static_library('xkbfile',", 1)
-    # `version` is a shared-library keyword.
-    s = s.replace("""        sources: libxkbfile_sources,
-        version: '1.0.2'
-)""", """        sources: libxkbfile_sources,
-)""", 1)
+    # `version` and `darwin_versions` are shared-library keywords (libxkbfile's
+    # master gained the second on 2026-11-23), which meson refuses here.
+    import re
+    s = re.sub(r"^\s*(version|darwin_versions):.*\n", "", s, flags=re.M)
     assert 'static_library' in s, 'libxkbfile: the library target did not match'
     open(p, 'w').write(s)
 PATCH
