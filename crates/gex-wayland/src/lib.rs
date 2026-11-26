@@ -4553,7 +4553,7 @@ mod tests {
     #[test]
     fn a_fractional_scale_is_told_and_the_viewport_sizes_the_surface() {
         // At devicePixelRatio 1.5: wl_output.scale 2, preferred_scale 180.
-        // winewayland binds the manager (the last global, name 13), gets a
+        // winewayland binds the manager (the last global), gets a
         // fractional scale for its window and a viewport, and sets the
         // destination in surface units; the record carries both.
         let pool = Placed(0x6000, 8192);
@@ -4561,7 +4561,8 @@ mod tests {
         c.set_scale120(180);
         assert_eq!(c.scale, 2);
         c.take_outgoing();
-        c.receive(&Writer::new(2, 0).uint(13).string("wp_fractional_scale_manager_v1").uint(1).new_id(60).finish(), &[], &pool);
+        let name = GLOBALS.iter().position(|g| g.0 == "wp_fractional_scale_manager_v1").unwrap() as u32 + 1;
+        c.receive(&Writer::new(2, 0).uint(name).string("wp_fractional_scale_manager_v1").uint(1).new_id(60).finish(), &[], &pool);
         c.receive(&Writer::new(60, 1).new_id(61).object(6).finish(), &[], &pool);
         let told = messages(&c.take_outgoing());
         let scale = told.iter().find(|(id, op, _)| *id == 61 && *op == 0).expect("no preferred_scale");
