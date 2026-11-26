@@ -48,7 +48,10 @@ while [ $# -gt 0 ]; do
     --sp) MP=0 SP=1 ;;
     --both) MP=1 SP=1 ;;
     --debug) DEBUG=1 ;;
-    --lib) LIB=$(realpath -m "${2:?runtime/app/build.sh --lib DIR}"); shift ;;
+    # (made first and taken by cd: --lib needs no GNU tools, so a caller
+    # without host-env.sh's PATH, as Stellite's Linux runtime build is,
+    # can run it; macOS's realpath has no -m)
+    --lib) mkdir -p "${2:?runtime/app/build.sh --lib DIR}" && LIB=$(cd "$2" && pwd); shift ;;
     *) echo "usage: runtime/app/build.sh [--mp | --sp | --both] [--debug] | --lib DIR" >&2; exit 2 ;;
     esac
     shift
